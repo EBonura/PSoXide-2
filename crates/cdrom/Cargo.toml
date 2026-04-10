@@ -1,0 +1,8 @@
+[package]
+name = "cdrom"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+crossbeam-channel.workspace = true

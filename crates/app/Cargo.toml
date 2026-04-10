@@ -1,0 +1,20 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+core = { path = "../core" }
+gpu = { path = "../gpu" }
+spu = { path = "../spu" }
+cdrom = { path = "../cdrom" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+clap = { version = "4", features = ["derive"] }
+winit = "0.30"
+wgpu = "24"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"

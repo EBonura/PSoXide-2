@@ -1,0 +1,14 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpu = { path = "../gpu" }
+spu = { path = "../spu" }
+cdrom = { path = "../cdrom" }
+tracing.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+crossbeam-channel.workspace = true
+anyhow = "1"

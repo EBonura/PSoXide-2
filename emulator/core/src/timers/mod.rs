@@ -1,176 +1,328 @@
-use crate::scheduler::Scheduler;
+/// Root counters — matching PCSX-Redux psxcounters.cc architecture.
+///
+/// 4 counters total:
+///   0-2: hardware root counters (mapped to 0x1F801100-0x1F801128)
+///   3:   virtual "base" counter driving hsync/vblank timing
+///
+/// Counter values are computed on-read from (cycle - cycleStart) / rate.
+/// Each counter has two states: CountToTarget and CountToOverflow.
+/// IRQs fire via pending_irqs bitmask (caller drains into ISTAT).
 
-const CPU_CLOCK: u64 = 33_868_800;
-const NTSC_FPS: u64 = 60;
-const NTSC_SCANLINES: u64 = 263;
-const NTSC_VBLANK_START: u64 = 243;
-const CYCLES_PER_SCANLINE: u64 = CPU_CLOCK / (NTSC_FPS * NTSC_SCANLINES); // ~2147
+const PSX_CLOCK: u64 = 33_868_800;
+const COUNTER_COUNT: usize = 4;
+const COUNT_TO_OVERFLOW: u32 = 0;
+const COUNT_TO_TARGET: u32 = 1;
 
-pub struct Timers {
-    pub counters: [Counter; 3],
-    // Virtual counter 3: VBlank tracking
-    pub hsync_count: u64,
-    pub next_hsync: u64,
-    pub next_vblank: u64,
-    pub in_vblank: bool,
-    pub frame_count: u64,
-}
+// NTSC timing
+const FRAME_RATE: u32 = 60;
+const HSYNC_TOTAL: u32 = 263;
+const VBLANK_START: u32 = 243;
+
+// Mode flag bits (matching Redux enum)
+const RC_COUNT_TO_TARGET: u16 = 0x0008;
+const RC_IRQ_ON_TARGET: u16 = 0x0010;
+const RC_IRQ_ON_OVERFLOW: u16 = 0x0020;
+const RC_IRQ_REGENERATE: u16 = 0x0040;
+const RC0_PIXEL_CLOCK: u16 = 0x0100;
+const RC1_HSYNC_CLOCK: u16 = 0x0100;
+const RC2_DISABLE: u16 = 0x0001;
+const RC2_ONE_EIGHTH_CLOCK: u16 = 0x0200;
+const RC_IRQ_REQUEST: u16 = 0x0400;
+const RC_COUNT_EQ_TARGET: u16 = 0x0800;
+const RC_OVERFLOW: u16 = 0x1000;
 
 #[derive(Clone)]
-pub struct Counter {
-    pub value: u16,
-    pub target: u16,
-    pub mode: u16,
-    pub cycle_start: u64,
-    pub paused: bool,
+struct Rcnt {
+    mode: u16,
+    target: u16,
+    rate: u32,
+    irq: u32,           // IRQ bitmask for ISTAT (0x10, 0x20, 0x40)
+    counter_state: u32, // CountToTarget or CountToOverflow
+    irq_state: bool,
+    cycle: u64,         // cycles from cycleStart until next event fires
+    cycle_start: u64,   // reference cycle for counter value computation
 }
 
-impl Counter {
+impl Rcnt {
     fn new() -> Self {
         Self {
-            value: 0,
-            target: 0,
             mode: 0,
+            target: 0,
+            rate: 1,
+            irq: 0,
+            counter_state: COUNT_TO_OVERFLOW,
+            irq_state: false,
+            cycle: 0,
             cycle_start: 0,
-            paused: false,
         }
     }
+}
+
+pub struct Timers {
+    rcnts: [Rcnt; COUNTER_COUNT],
+    hsync_count: u32,
+    /// Next cycle at which update() needs to run
+    pub next_counter: u64,
+    /// Accumulated IRQ bitmask — caller drains into ISTAT
+    pending_irqs: u32,
 }
 
 impl Timers {
     pub fn new() -> Self {
-        Self {
-            counters: [Counter::new(), Counter::new(), Counter::new()],
+        let mut t = Self {
+            rcnts: [Rcnt::new(), Rcnt::new(), Rcnt::new(), Rcnt::new()],
             hsync_count: 0,
-            next_hsync: CYCLES_PER_SCANLINE,
-            next_vblank: NTSC_VBLANK_START * CYCLES_PER_SCANLINE,
-            in_vblank: false,
-            frame_count: 0,
+            next_counter: 0,
+            pending_irqs: 0,
+        };
+        t.init(0);
+        t
+    }
+
+    fn init(&mut self, cycle: u64) {
+        // Counter 0: dot clock (pixel clock when bit 8 set, else system clock)
+        self.rcnts[0].rate = 1;
+        self.rcnts[0].irq = 0x10; // IRQ4
+
+        // Counter 1: hsync clock when bit 8 set, else system clock
+        self.rcnts[1].rate = 1;
+        self.rcnts[1].irq = 0x20; // IRQ5
+
+        // Counter 2: 1/8 system clock when bit 9 set, else system clock
+        self.rcnts[2].rate = 1;
+        self.rcnts[2].irq = 0x40; // IRQ6
+
+        // Counter 3: virtual base counter (hsync driver)
+        self.rcnts[3].rate = 1;
+        self.rcnts[3].mode = RC_COUNT_TO_TARGET;
+        self.rcnts[3].target =
+            (PSX_CLOCK / (FRAME_RATE as u64 * HSYNC_TOTAL as u64)) as u16;
+
+        for i in 0..COUNTER_COUNT {
+            self.write_counter_internal(i, 0, cycle);
+        }
+
+        self.hsync_count = 0;
+        self.recompute_next(cycle);
+    }
+
+    // ======== Internal helpers ========
+
+    fn fire_irq(&mut self, mask: u32) {
+        self.pending_irqs |= mask;
+    }
+
+    /// Drain accumulated IRQs. Caller should OR result into ISTAT.
+    pub fn drain_irqs(&mut self) -> u32 {
+        let irqs = self.pending_irqs;
+        self.pending_irqs = 0;
+        irqs
+    }
+
+    /// Set counter value and determine next event (target or overflow).
+    /// Matching Redux writeCounterInternal().
+    fn write_counter_internal(&mut self, index: usize, value: u32, cycle: u64) {
+        let value = value & 0xFFFF;
+        let rate = self.rcnts[index].rate as u64;
+        let target = self.rcnts[index].target;
+
+        self.rcnts[index].cycle_start = cycle.wrapping_sub(value as u64 * rate);
+
+        if value < target as u32 {
+            self.rcnts[index].cycle = target as u64 * rate;
+            self.rcnts[index].counter_state = COUNT_TO_TARGET;
+        } else {
+            self.rcnts[index].cycle = 0xFFFF_u64 * rate;
+            self.rcnts[index].counter_state = COUNT_TO_OVERFLOW;
         }
     }
 
-    pub fn update(&mut self, cycle: u64, scheduler: &mut Scheduler) -> bool {
-        let mut vblank_fired = false;
+    /// Read current counter value from cycle delta.
+    /// Matching Redux readCounterInternal().
+    fn read_counter_internal(&self, index: usize, cycle: u64) -> u32 {
+        let count = cycle.wrapping_sub(self.rcnts[index].cycle_start)
+            / self.rcnts[index].rate as u64;
+        (count & 0xFFFF) as u32
+    }
 
-        // Check HSync (scanline boundary)
-        while cycle >= self.next_hsync {
-            self.hsync_count += 1;
-            self.next_hsync += CYCLES_PER_SCANLINE;
+    /// Recompute next_counter deadline across all 4 counters.
+    /// Matching Redux set().
+    fn recompute_next(&mut self, cycle: u64) {
+        let mut next: i64 = i64::MAX;
 
-            // Update counter 1 if in HSync clock mode
-            if self.counters[1].mode & 0x100 != 0 && !self.counters[1].paused {
-                self.counters[1].value = self.counters[1].value.wrapping_add(1);
-                self.check_counter_irq(1, scheduler, cycle);
+        for i in 0..COUNTER_COUNT {
+            let elapsed = cycle.wrapping_sub(self.rcnts[i].cycle_start);
+            let count_to_update = self.rcnts[i].cycle as i64 - elapsed as i64;
+
+            if count_to_update < 0 {
+                next = 0;
+                break;
+            }
+            if count_to_update < next {
+                next = count_to_update;
             }
         }
 
-        // Check VBlank
-        if cycle >= self.next_vblank {
-            if !self.in_vblank {
-                self.in_vblank = true;
-                vblank_fired = true;
-                self.next_vblank = (self.frame_count + 1) * NTSC_SCANLINES * CYCLES_PER_SCANLINE;
+        self.next_counter = cycle.wrapping_add(next as u64);
+    }
+
+    /// Handle counter reaching target or overflow.
+    /// Fires IRQs, resets counter, sets mode flags.
+    /// Matching Redux reset().
+    fn reset(&mut self, index: usize, cycle: u64) {
+        // Copy fields to avoid borrow conflicts
+        let counter_state = self.rcnts[index].counter_state;
+        let mode = self.rcnts[index].mode;
+        let target = self.rcnts[index].target;
+        let rate = self.rcnts[index].rate as u64;
+        let cycle_start = self.rcnts[index].cycle_start;
+        let irq = self.rcnts[index].irq;
+        let irq_state = self.rcnts[index].irq_state;
+
+        if counter_state == COUNT_TO_TARGET {
+            let count = if mode & RC_COUNT_TO_TARGET != 0 {
+                // Reset to 0 on target — compute overshoot
+                let c = cycle.wrapping_sub(cycle_start) / rate;
+                c.wrapping_sub(target as u64)
             } else {
-                // End of VBlank, start new frame
-                self.in_vblank = false;
-                self.frame_count += 1;
-                self.hsync_count = 0;
-                self.next_vblank = self.frame_count * NTSC_SCANLINES * CYCLES_PER_SCANLINE
-                    + NTSC_VBLANK_START * CYCLES_PER_SCANLINE;
+                // Don't reset — just read current value
+                self.read_counter_internal(index, cycle) as u64
+            };
+
+            self.write_counter_internal(index, count as u32, cycle);
+
+            if mode & RC_IRQ_ON_TARGET != 0 {
+                if (mode & RC_IRQ_REGENERATE != 0) || !irq_state {
+                    self.fire_irq(irq);
+                    self.rcnts[index].irq_state = true;
+                }
             }
+
+            self.rcnts[index].mode |= RC_COUNT_EQ_TARGET;
+        } else if counter_state == COUNT_TO_OVERFLOW {
+            let count = cycle.wrapping_sub(cycle_start) / rate;
+            let count = count.wrapping_sub(0xFFFF);
+
+            self.write_counter_internal(index, count as u32, cycle);
+
+            if mode & RC_IRQ_ON_OVERFLOW != 0 {
+                if (mode & RC_IRQ_REGENERATE != 0) || !irq_state {
+                    self.fire_irq(irq);
+                    self.rcnts[index].irq_state = true;
+                }
+            }
+
+            self.rcnts[index].mode |= RC_OVERFLOW;
         }
 
-        // Update counters 0 and 2 based on system clock
-        for i in [0usize, 2] {
-            if self.counters[i].paused {
-                continue;
-            }
-            let rate = self.counter_rate(i);
-            if rate == 0 {
-                continue;
-            }
-            let elapsed = cycle.saturating_sub(self.counters[i].cycle_start);
-            let ticks = (elapsed / rate) as u16;
-            if ticks > 0 {
-                self.counters[i].value = self.counters[i].value.wrapping_add(ticks);
-                self.counters[i].cycle_start = cycle;
-                self.check_counter_irq(i, scheduler, cycle);
-            }
-        }
-
-        vblank_fired
+        self.rcnts[index].mode |= RC_IRQ_REQUEST;
+        self.recompute_next(cycle);
     }
 
-    fn counter_rate(&self, index: usize) -> u64 {
+    // ======== Public API ========
+
+    /// Main update — called from branchTest when cycle >= next_counter.
+    /// Matching Redux update() (minus SPU/SIO1 sync).
+    pub fn update(&mut self, cycle: u64) {
+        // Counter 0
+        if cycle.wrapping_sub(self.rcnts[0].cycle_start) >= self.rcnts[0].cycle {
+            self.reset(0, cycle);
+        }
+
+        // Counter 1
+        if cycle.wrapping_sub(self.rcnts[1].cycle_start) >= self.rcnts[1].cycle {
+            self.reset(1, cycle);
+        }
+
+        // Counter 2
+        if cycle.wrapping_sub(self.rcnts[2].cycle_start) >= self.rcnts[2].cycle {
+            self.reset(2, cycle);
+        }
+
+        // Counter 3 (base — hsync driver)
+        if cycle.wrapping_sub(self.rcnts[3].cycle_start) >= self.rcnts[3].cycle {
+            self.reset(3, cycle);
+
+            self.hsync_count += 1;
+
+            // VBlank IRQ at scanline 243 (NTSC)
+            if self.hsync_count == VBLANK_START {
+                self.fire_irq(0x01); // IRQ0 = VBlank
+            }
+
+            // Frame boundary — reset scanline counter
+            if self.hsync_count >= HSYNC_TOTAL {
+                self.hsync_count = 0;
+            }
+        }
+    }
+
+    /// Write counter value register. Matching Redux writeCounter().
+    pub fn write_counter(&mut self, index: usize, value: u32, cycle: u64) {
+        self.update(cycle);
+        self.write_counter_internal(index, value, cycle);
+        self.recompute_next(cycle);
+    }
+
+    /// Write mode register. Matching Redux writeMode().
+    pub fn write_mode(&mut self, index: usize, value: u32, cycle: u64) {
+        self.update(cycle);
+        self.rcnts[index].mode = value as u16;
+        self.rcnts[index].irq_state = false;
+
         match index {
             0 => {
-                if self.counters[0].mode & 0x100 != 0 {
-                    11 // Pixel clock (~3.07MHz, ~11 CPU clocks per pixel)
+                self.rcnts[0].rate = if value as u16 & RC0_PIXEL_CLOCK != 0 { 5 } else { 1 };
+            }
+            1 => {
+                self.rcnts[1].rate = if value as u16 & RC1_HSYNC_CLOCK != 0 {
+                    (PSX_CLOCK / (FRAME_RATE as u64 * HSYNC_TOTAL as u64)) as u32
                 } else {
-                    1 // System clock
-                }
+                    1
+                };
             }
             2 => {
-                if self.counters[2].mode & 0x200 != 0 {
-                    8 // 1/8 system clock
+                self.rcnts[2].rate = if value as u16 & RC2_ONE_EIGHTH_CLOCK != 0 {
+                    8
                 } else {
-                    1 // System clock
+                    1
+                };
+                if value as u16 & RC2_DISABLE != 0 {
+                    self.rcnts[2].rate = 0xFFFF_FFFF;
                 }
             }
-            _ => 1,
-        }
-    }
-
-    fn check_counter_irq(&mut self, index: usize, _scheduler: &mut Scheduler, _cycle: u64) {
-        let counter = &mut self.counters[index];
-        let mode = counter.mode;
-
-        // Check target hit
-        if mode & 0x10 != 0 && counter.value >= counter.target {
-            // IRQ on target
-            counter.mode |= 0x0800; // Set target reached flag
-            if mode & 0x08 != 0 {
-                counter.value = 0; // Reset to 0 on target
-            }
+            _ => {}
         }
 
-        // Check overflow
-        if mode & 0x20 != 0 && counter.value == 0xFFFF {
-            counter.mode |= 0x1000; // Set overflow flag
-        }
+        self.write_counter_internal(index, 0, cycle);
+        self.recompute_next(cycle);
     }
 
-    pub fn read_counter(&self, index: usize) -> u16 {
-        self.counters[index].value
+    /// Write target register. Matching Redux writeTarget().
+    pub fn write_target(&mut self, index: usize, value: u32, cycle: u64) {
+        self.update(cycle);
+        self.rcnts[index].target = value as u16;
+        let count = self.read_counter_internal(index, cycle);
+        self.write_counter_internal(index, count, cycle);
+        self.recompute_next(cycle);
     }
 
-    pub fn read_mode(&mut self, index: usize) -> u16 {
-        let mode = self.counters[index].mode;
-        // Reading mode resets bits 11 and 12
-        self.counters[index].mode &= !0x1800;
-        mode
+    /// Read counter value. Matching Redux readCounter().
+    pub fn read_counter(&mut self, index: usize, cycle: u64) -> u32 {
+        self.update(cycle);
+        self.read_counter_internal(index, cycle)
     }
 
-    pub fn read_target(&self, index: usize) -> u16 {
-        self.counters[index].target
+    /// Read mode register. Clears bits 11-12 on read. Matching Redux readMode().
+    pub fn read_mode(&mut self, index: usize, cycle: u64) -> u32 {
+        self.update(cycle);
+        let mode = self.rcnts[index].mode;
+        self.rcnts[index].mode &= 0xE7FF; // Clear CountEqTarget + Overflow flags
+        mode as u32
     }
 
-    pub fn write_counter(&mut self, index: usize, value: u16, cycle: u64) {
-        self.counters[index].value = value;
-        self.counters[index].cycle_start = cycle;
-    }
-
-    pub fn write_mode(&mut self, index: usize, value: u16, cycle: u64) {
-        self.counters[index].mode = value;
-        self.counters[index].value = 0;
-        self.counters[index].cycle_start = cycle;
-    }
-
-    pub fn write_target(&mut self, index: usize, value: u16) {
-        self.counters[index].target = value;
-    }
-
-    pub fn vblank_irq_pending(&self) -> bool {
-        self.in_vblank
+    /// Read target register.
+    pub fn read_target(&self, index: usize) -> u32 {
+        self.rcnts[index].target as u32
     }
 }

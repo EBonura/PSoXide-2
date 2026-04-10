@@ -25,11 +25,16 @@ pub struct Bus {
 
 impl Bus {
     pub fn new() -> Self {
+        let mut hw_regs: Box<[u8; 0x1_0000]> = vec![0u8; 0x1_0000].into_boxed_slice().try_into().unwrap();
+        // Pre-set IMASK to enable VBlank (bit 0) so the BIOS's WaitEvent
+        // can be delivered when it enables IEc. Without this, the BIOS's
+        // event setup (which calls WaitEvent before writing IMASK) times out.
+        hw_regs[0x1074] = 0x01; // IMASK bit 0 = VBlank
         Self {
             ram: vec![0u8; 0x0020_0000].into_boxed_slice().try_into().unwrap(),
             bios: vec![0u8; 0x0008_0000].into_boxed_slice().try_into().unwrap(),
             scratchpad: vec![0u8; 0x400].into_boxed_slice().try_into().unwrap(),
-            hw_regs: vec![0u8; 0x1_0000].into_boxed_slice().try_into().unwrap(),
+            hw_regs,
             gpu: Gpu::new(),
             spu: Spu::new(),
             cdrom: CdRom::new(),
@@ -234,15 +239,15 @@ impl Bus {
             0x1074 => self.read_hw_reg16(offset),
 
             // Timers
-            0x1100 => self.timers.read_counter(0),
-            0x1104 => self.timers.read_mode(0),
-            0x1108 => self.timers.read_target(0),
-            0x1110 => self.timers.read_counter(1),
-            0x1114 => self.timers.read_mode(1),
-            0x1118 => self.timers.read_target(1),
-            0x1120 => self.timers.read_counter(2),
-            0x1124 => self.timers.read_mode(2),
-            0x1128 => self.timers.read_target(2),
+            0x1100 => { let v = self.timers.read_counter(0, self.last_cycle); self.drain_timer_irqs(); v as u16 }
+            0x1104 => { let v = self.timers.read_mode(0, self.last_cycle); self.drain_timer_irqs(); v as u16 }
+            0x1108 => self.timers.read_target(0) as u16,
+            0x1110 => { let v = self.timers.read_counter(1, self.last_cycle); self.drain_timer_irqs(); v as u16 }
+            0x1114 => { let v = self.timers.read_mode(1, self.last_cycle); self.drain_timer_irqs(); v as u16 }
+            0x1118 => self.timers.read_target(1) as u16,
+            0x1120 => { let v = self.timers.read_counter(2, self.last_cycle); self.drain_timer_irqs(); v as u16 }
+            0x1124 => { let v = self.timers.read_mode(2, self.last_cycle); self.drain_timer_irqs(); v as u16 }
+            0x1128 => self.timers.read_target(2) as u16,
 
             // SPU
             0x1C00..=0x1FFF => {
@@ -282,15 +287,15 @@ impl Bus {
             0x1814 => self.gpu.read_status(),
 
             // Timers
-            0x1100 => self.timers.read_counter(0) as u32,
-            0x1104 => self.timers.read_mode(0) as u32,
-            0x1108 => self.timers.read_target(0) as u32,
-            0x1110 => self.timers.read_counter(1) as u32,
-            0x1114 => self.timers.read_mode(1) as u32,
-            0x1118 => self.timers.read_target(1) as u32,
-            0x1120 => self.timers.read_counter(2) as u32,
-            0x1124 => self.timers.read_mode(2) as u32,
-            0x1128 => self.timers.read_target(2) as u32,
+            0x1100 => { let v = self.timers.read_counter(0, self.last_cycle); self.drain_timer_irqs(); v }
+            0x1104 => { let v = self.timers.read_mode(0, self.last_cycle); self.drain_timer_irqs(); v }
+            0x1108 => self.timers.read_target(0),
+            0x1110 => { let v = self.timers.read_counter(1, self.last_cycle); self.drain_timer_irqs(); v }
+            0x1114 => { let v = self.timers.read_mode(1, self.last_cycle); self.drain_timer_irqs(); v }
+            0x1118 => self.timers.read_target(1),
+            0x1120 => { let v = self.timers.read_counter(2, self.last_cycle); self.drain_timer_irqs(); v }
+            0x1124 => { let v = self.timers.read_mode(2, self.last_cycle); self.drain_timer_irqs(); v }
+            0x1128 => self.timers.read_target(2),
 
             // Memory control
             0x1000..=0x1024 => self.read_hw_reg32(offset),
@@ -351,15 +356,15 @@ impl Bus {
             0x1074 => self.write_hw_reg16(offset, value),
 
             // Timers
-            0x1100 => self.timers.write_counter(0, value, 0),
-            0x1104 => self.timers.write_mode(0, value, 0),
-            0x1108 => self.timers.write_target(0, value),
-            0x1110 => self.timers.write_counter(1, value, 0),
-            0x1114 => self.timers.write_mode(1, value, 0),
-            0x1118 => self.timers.write_target(1, value),
-            0x1120 => self.timers.write_counter(2, value, 0),
-            0x1124 => self.timers.write_mode(2, value, 0),
-            0x1128 => self.timers.write_target(2, value),
+            0x1100 => { self.timers.write_counter(0, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1104 => { self.timers.write_mode(0, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1108 => { self.timers.write_target(0, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1110 => { self.timers.write_counter(1, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1114 => { self.timers.write_mode(1, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1118 => { self.timers.write_target(1, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1120 => { self.timers.write_counter(2, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1124 => { self.timers.write_mode(2, value as u32, self.last_cycle); self.drain_timer_irqs(); }
+            0x1128 => { self.timers.write_target(2, value as u32, self.last_cycle); self.drain_timer_irqs(); }
 
             // SPU
             0x1C00..=0x1FFF => {
@@ -425,15 +430,15 @@ impl Bus {
             0x1814 => self.gpu.gp1_write(value),
 
             // Timers
-            0x1100 => self.timers.write_counter(0, value as u16, 0),
-            0x1104 => self.timers.write_mode(0, value as u16, 0),
-            0x1108 => self.timers.write_target(0, value as u16),
-            0x1110 => self.timers.write_counter(1, value as u16, 0),
-            0x1114 => self.timers.write_mode(1, value as u16, 0),
-            0x1118 => self.timers.write_target(1, value as u16),
-            0x1120 => self.timers.write_counter(2, value as u16, 0),
-            0x1124 => self.timers.write_mode(2, value as u16, 0),
-            0x1128 => self.timers.write_target(2, value as u16),
+            0x1100 => { self.timers.write_counter(0, value, self.last_cycle); self.drain_timer_irqs(); }
+            0x1104 => { self.timers.write_mode(0, value, self.last_cycle); self.drain_timer_irqs(); }
+            0x1108 => { self.timers.write_target(0, value & 0xFFFF, self.last_cycle); self.drain_timer_irqs(); }
+            0x1110 => { self.timers.write_counter(1, value, self.last_cycle); self.drain_timer_irqs(); }
+            0x1114 => { self.timers.write_mode(1, value, self.last_cycle); self.drain_timer_irqs(); }
+            0x1118 => { self.timers.write_target(1, value & 0xFFFF, self.last_cycle); self.drain_timer_irqs(); }
+            0x1120 => { self.timers.write_counter(2, value, self.last_cycle); self.drain_timer_irqs(); }
+            0x1124 => { self.timers.write_mode(2, value, self.last_cycle); self.drain_timer_irqs(); }
+            0x1128 => { self.timers.write_target(2, value & 0xFFFF, self.last_cycle); self.drain_timer_irqs(); }
 
             // Memory control
             0x1000..=0x1024 => {
@@ -498,6 +503,15 @@ impl Bus {
 
     pub fn read_imask(&self) -> u32 {
         self.read_hw_reg32(0x1074)
+    }
+
+    /// Drain pending timer IRQs into ISTAT.
+    pub fn drain_timer_irqs(&mut self) {
+        let irqs = self.timers.drain_irqs();
+        if irqs != 0 {
+            let istat = self.read_hw_reg32(0x1070);
+            self.write_hw_reg32(0x1070, istat | irqs);
+        }
     }
 
     pub fn set_irq(&mut self, bit: u32) {

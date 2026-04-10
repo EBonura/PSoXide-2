@@ -50,7 +50,8 @@ impl Cpu {
             0x32 => self.op_lwc2(bus, code),
             0x3A => self.op_swc2(bus, code),
             _ => {
-                tracing::warn!("Unhandled opcode {:02X} at PC {:08X}", op(code), self.regs.pc.wrapping_sub(4));
+                // Matching Redux psxNULL(): fire Reserved Instruction exception
+                exceptions::exception(self, bus, exceptions::Exception::ReservedInstruction);
             }
         }
     }
@@ -86,7 +87,7 @@ impl Cpu {
             0x2A => self.op_slt(code),
             0x2B => self.op_sltu(code),
             _ => {
-                tracing::warn!("Unhandled SPECIAL funct {:02X} at PC {:08X}", funct(code), self.regs.pc.wrapping_sub(4));
+                exceptions::exception(self, bus, exceptions::Exception::ReservedInstruction);
             }
         }
     }
@@ -130,7 +131,22 @@ impl Cpu {
                 // Matching Redux MTC0(): special handling for Status and Cause
                 match reg {
                     CP0_STATUS => {
+                        // Trace Status writes around the crash window
+                        let old = self.regs.cp0[CP0_STATUS];
                         self.regs.cp0[CP0_STATUS] = val;
+                        {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static N: AtomicU32 = AtomicU32::new(0);
+                            let cyc = self.regs.cycle;
+                            // Only trace after cycle 5M (near the crash)
+                            if cyc > 5_000_000 {
+                                let n = N.fetch_add(1, Ordering::Relaxed);
+                                if n < 20 {
+                                    eprintln!("MTC0_S {:>2}: PC={:08X} old={:08X} new={:08X} cyc={}",
+                                        n, self.regs.pc.wrapping_sub(4), old, val, cyc);
+                                }
+                            }
+                        }
                         self.test_sw_ints(bus);
                     }
                     CP0_CAUSE => {
@@ -144,8 +160,19 @@ impl Cpu {
                 }
             }
             0x10 => { // RFE — matching Redux psxRFE()
-                let status = self.regs.cp0[CP0_STATUS];
-                self.regs.cp0[CP0_STATUS] = (status & 0xFFFF_FFF0) | ((status & 0x3C) >> 2);
+                let old = self.regs.cp0[CP0_STATUS];
+                self.regs.cp0[CP0_STATUS] = (old & 0xFFFF_FFF0) | ((old & 0x3C) >> 2);
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static NR: AtomicU32 = AtomicU32::new(0);
+                    if self.regs.cycle > 5_000_000 {
+                        let n = NR.fetch_add(1, Ordering::Relaxed);
+                        if n < 20 {
+                            eprintln!("RFE    {:>2}: PC={:08X} old={:08X} new={:08X} cyc={}",
+                                n, self.regs.pc.wrapping_sub(4), old, self.regs.cp0[CP0_STATUS], self.regs.cycle);
+                        }
+                    }
+                }
                 self.test_sw_ints(bus);
             }
             _ => {
@@ -230,16 +257,11 @@ impl Cpu {
 
     // ======== Arithmetic Immediate ========
 
-    fn op_addi(&mut self, bus: &mut Bus, code: u32) {
-        let s = self.regs.gpr[rs(code)] as i32;
-        let imm = imm_se(code) as i32;
-        match s.checked_add(imm) {
-            Some(result) => {
-                self.cancel_delayed_load(rt(code) as u32);
-                self.regs.set_gpr(rt(code), result as u32);
-            }
-            None => exceptions::exception(self, bus, exceptions::Exception::ArithmeticOverflow),
-        }
+    fn op_addi(&mut self, _bus: &mut Bus, code: u32) {
+        // Redux: overflow exception only in debug mode; normal mode wraps silently
+        let result = self.regs.gpr[rs(code)].wrapping_add(imm_se(code));
+        self.cancel_delayed_load(rt(code) as u32);
+        self.regs.set_gpr(rt(code), result);
     }
 
     fn op_addiu(&mut self, code: u32) {
@@ -286,16 +308,11 @@ impl Cpu {
 
     // ======== Arithmetic Register ========
 
-    fn op_add(&mut self, bus: &mut Bus, code: u32) {
-        let s = self.regs.gpr[rs(code)] as i32;
-        let t = self.regs.gpr[rt(code)] as i32;
-        match s.checked_add(t) {
-            Some(result) => {
-                self.cancel_delayed_load(rd(code) as u32);
-                self.regs.set_gpr(rd(code), result as u32);
-            }
-            None => exceptions::exception(self, bus, exceptions::Exception::ArithmeticOverflow),
-        }
+    fn op_add(&mut self, _bus: &mut Bus, code: u32) {
+        // Redux: overflow exception only in debug mode; normal mode wraps silently
+        let result = self.regs.gpr[rs(code)].wrapping_add(self.regs.gpr[rt(code)]);
+        self.cancel_delayed_load(rd(code) as u32);
+        self.regs.set_gpr(rd(code), result);
     }
 
     fn op_addu(&mut self, code: u32) {
@@ -304,16 +321,11 @@ impl Cpu {
         self.regs.set_gpr(rd(code), result);
     }
 
-    fn op_sub(&mut self, bus: &mut Bus, code: u32) {
-        let s = self.regs.gpr[rs(code)] as i32;
-        let t = self.regs.gpr[rt(code)] as i32;
-        match s.checked_sub(t) {
-            Some(result) => {
-                self.cancel_delayed_load(rd(code) as u32);
-                self.regs.set_gpr(rd(code), result as u32);
-            }
-            None => exceptions::exception(self, bus, exceptions::Exception::ArithmeticOverflow),
-        }
+    fn op_sub(&mut self, _bus: &mut Bus, code: u32) {
+        // Redux: overflow exception only in debug mode; normal mode wraps silently
+        let result = self.regs.gpr[rs(code)].wrapping_sub(self.regs.gpr[rt(code)]);
+        self.cancel_delayed_load(rd(code) as u32);
+        self.regs.set_gpr(rd(code), result);
     }
 
     fn op_subu(&mut self, code: u32) {
@@ -599,7 +611,12 @@ impl Cpu {
     }
 
     fn op_sw(&mut self, bus: &mut Bus, code: u32) {
-        if self.regs.cp0[CP0_STATUS] & 0x10000 != 0 { return; } // Cache isolation — drop write
+        if self.regs.cp0[CP0_STATUS] & 0x10000 != 0 {
+            // Cache isolation — write to icache (matching Redux)
+            let addr = self.regs.gpr[rs(code)].wrapping_add(imm_se(code));
+            self.write_icache(addr, self.regs.gpr[rt(code)]);
+            return;
+        }
         let addr = self.regs.gpr[rs(code)].wrapping_add(imm_se(code));
         if addr & 3 != 0 {
             self.regs.cp0[CP0_BADVADDR] = addr;

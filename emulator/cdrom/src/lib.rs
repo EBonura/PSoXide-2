@@ -50,6 +50,7 @@ const CDL_SEEKL: u8 = 21;
 const CDL_SEEKP: u8 = 22;
 const CDL_TEST: u8 = 25;
 const CDL_ID: u8 = 26;
+const CDL_STANDBY: u8 = 7;
 const CDL_READS: u8 = 27;
 const CDL_INIT: u8 = 28;
 const CDL_READTOC: u8 = 30;
@@ -272,65 +273,71 @@ impl CdRom {
         let mut no_busy_error = false;
         let mut start_rotating = false;
 
-        match irq as u8 {
-            CDL_GETSTAT => {
+        // Match on full u16 irq — the 0x100 offset distinguishes first-phase
+        // responses from delayed (second-phase) responses.
+        // Constants are u8, so cast to u16 for matching.
+        let cmd = irq;
+        match cmd {
+            // ======== First-phase responses (irq < 0x100) ========
+            x if x == CDL_GETSTAT as u16 => {
                 if self.drive_state != DRIVESTATE_LID_OPEN { self.stat_p &= !STATUS_SHELLOPEN; }
                 no_busy_error = true;
             }
-            CDL_SETLOC | CDL_SETFILTER | CDL_MUTE | CDL_DEMUTE => {}
-            CDL_SETMODE => { no_busy_error = true; }
-            CDL_GETPARAM => {
+            x if x == CDL_SETLOC as u16 || x == CDL_SETFILTER as u16
+                || x == CDL_MUTE as u16 || x == CDL_DEMUTE as u16 => {}
+            x if x == CDL_SETMODE as u16 => { no_busy_error = true; }
+            x if x == CDL_GETPARAM as u16 => {
                 self.set_result_size(5);
                 self.result[1] = self.mode; self.result[2] = 0;
                 self.result[3] = self.file; self.result[4] = self.channel;
                 no_busy_error = true;
             }
-            CDL_GETLOCL => { self.set_result_size(8); self.result[..8].copy_from_slice(&self.transfer[..8]); }
-            CDL_GETLOCP => { self.set_result_size(8); self.result[..8].fill(0); }
-            CDL_GETTN => {
+            x if x == CDL_GETLOCL as u16 => { self.set_result_size(8); self.result[..8].copy_from_slice(&self.transfer[..8]); }
+            x if x == CDL_GETLOCP as u16 => { self.set_result_size(8); self.result[..8].fill(0); }
+            x if x == CDL_GETTN as u16 => {
                 if !self.has_disc { self.stat = DISK_ERROR; self.result[0] |= STATUS_ERROR; }
                 else { self.set_result_size(3); self.result[1] = 1; self.result[2] = 1; }
             }
-            CDL_GETTD => {
+            x if x == CDL_GETTD as u16 => {
                 if !self.has_disc { self.stat = DISK_ERROR; self.result[0] |= STATUS_ERROR; }
                 else { self.set_result_size(4); self.result[0] = self.stat_p; self.result[1] = 0; self.result[2] = 2; }
             }
-            CDL_TEST => {
+            x if x == CDL_TEST as u16 => {
                 if self.param[0] == 0x20 { self.set_result_size(4); self.result[..4].copy_from_slice(&TEST20); }
                 no_busy_error = true;
             }
-            CDL_ID => { self.add_irq_queue(CDL_ID as u16 + 0x100, 20480); }
-            CDL_INIT => {
+            x if x == CDL_ID as u16 => { self.add_irq_queue(CDL_ID as u16 + 0x100, 20480); }
+            x if x == CDL_INIT as u16 => {
                 self.stat_p |= STATUS_SHELLOPEN;
                 self.drive_state = DRIVESTATE_RESCAN_CD;
                 self.pending_irqs.push(CdInterrupt { irq_type: CdIrqType::Lid, delay: 20480 });
                 no_busy_error = true; start_rotating = true;
             }
-            CDL_RESET => {
+            x if x == CDL_RESET as u16 => {
                 self.muted = false; self.mode = 0x20;
                 self.add_irq_queue(CDL_RESET as u16 + 0x100, 4100000);
                 no_busy_error = true; start_rotating = true;
             }
-            CDL_STOP => {
+            x if x == CDL_STOP as u16 => {
                 self.stop_cdda(); self.stop_reading();
                 self.drive_state = DRIVESTATE_STOPPED;
                 self.add_irq_queue(CDL_STOP as u16 + 0x100, 0x800);
             }
-            CDL_PAUSE => {
+            x if x == CDL_PAUSE as u16 => {
                 let d = if self.drive_state == DRIVESTATE_STANDBY { 7000 } else { 1000000 };
                 self.add_irq_queue(CDL_PAUSE as u16 + 0x100, d);
                 self.ctrl |= BUSYSTS;
             }
-            CDL_STANDBY => {
-                self.add_irq_queue(7u16 + 0x100, CD_READ_TIME * 125 / 2);
+            x if x == CDL_STANDBY as u16 => {
+                self.add_irq_queue(CDL_STANDBY as u16 + 0x100, CD_READ_TIME * 125 / 2);
                 start_rotating = true;
             }
-            CDL_SEEKL | CDL_SEEKP => {
+            x if x == CDL_SEEKL as u16 || x == CDL_SEEKP as u16 => {
                 self.stop_cdda(); self.stop_reading();
                 self.stat_p |= STATUS_SEEK; self.seeked = 0;
                 start_rotating = true;
             }
-            CDL_READN | CDL_READS => {
+            x if x == CDL_READN as u16 || x == CDL_READS as u16 => {
                 if self.setloc_pending {
                     self.set_sector_play = self.set_sector;
                     self.setloc_pending = false; self.location_changed = true;
@@ -340,39 +347,48 @@ impl CdRom {
                 let delay = if self.mode & 0x80 != 0 { CD_READ_TIME } else { CD_READ_TIME * 2 };
                 self.pending_irqs.push(CdInterrupt { irq_type: CdIrqType::Read, delay });
             }
-            CDL_READTOC => {
+            x if x == CDL_READTOC as u16 => {
                 self.add_irq_queue(CDL_READTOC as u16 + 0x100, CD_READ_TIME * 180 / 4);
                 no_busy_error = true; start_rotating = true;
             }
-            _ => {
-                // Handle delayed responses (irq + 0x100)
-                match irq {
-                    x if x == CDL_ID as u16 + 0x100 => {
-                        self.set_result_size(8);
-                        if !self.has_disc {
-                            self.result[0] = 0x08; self.result[1] = 0x40; self.result[2..8].fill(0);
-                            self.stat = DISK_ERROR;
-                        } else {
-                            self.result[0] = self.stat_p; self.result[1] = 0; self.result[2] = 0; self.result[3] = 0;
-                            self.result[4..8].copy_from_slice(b"PCSX");
-                            self.stat = COMPLETE;
-                        }
-                    }
-                    x if x == CDL_RESET as u16 + 0x100 || x == CDL_STOP as u16 + 0x100
-                        || x == CDL_PAUSE as u16 + 0x100 || x == 7u16 + 0x100
-                        || x == CDL_READTOC as u16 + 0x100 => {
-                        if x == CDL_STOP as u16 + 0x100 { self.stat_p &= !STATUS_ROTATING; self.result[0] = self.stat_p; }
-                        if x == CDL_PAUSE as u16 + 0x100 { self.stat_p &= !STATUS_READ; self.result[0] = self.stat_p; }
-                        self.stat = COMPLETE;
-                        if x == CDL_READTOC as u16 + 0x100 { no_busy_error = true; }
-                    }
-                    _ => {
-                        self.set_result_size(2);
-                        self.result[0] = self.stat_p | STATUS_ERROR;
-                        self.result[1] = ERROR_INVALIDCMD;
-                        self.stat = DISK_ERROR;
-                    }
+
+            // ======== Delayed (second-phase) responses (irq >= 0x100) ========
+            x if x == CDL_ID as u16 + 0x100 => {
+                self.set_result_size(8);
+                if !self.has_disc {
+                    self.result[0] = 0x08; self.result[1] = 0x40; self.result[2..8].fill(0);
+                    self.stat = DISK_ERROR;
+                } else {
+                    self.result[0] = self.stat_p; self.result[1] = 0; self.result[2] = 0; self.result[3] = 0;
+                    self.result[4..8].copy_from_slice(b"PCSX");
+                    self.stat = COMPLETE;
                 }
+            }
+            x if x == CDL_RESET as u16 + 0x100 => {
+                self.stat = COMPLETE;
+            }
+            x if x == CDL_STOP as u16 + 0x100 => {
+                self.stat_p &= !STATUS_ROTATING; self.result[0] = self.stat_p;
+                self.stat = COMPLETE;
+            }
+            x if x == CDL_PAUSE as u16 + 0x100 => {
+                self.stat_p &= !STATUS_READ; self.result[0] = self.stat_p;
+                self.stat = COMPLETE;
+            }
+            x if x == CDL_STANDBY as u16 + 0x100 => {
+                self.stat = COMPLETE;
+            }
+            x if x == CDL_READTOC as u16 + 0x100 => {
+                self.stat = COMPLETE;
+                no_busy_error = true;
+            }
+
+            // ======== Unknown command ========
+            _ => {
+                self.set_result_size(2);
+                self.result[0] = self.stat_p | STATUS_ERROR;
+                self.result[1] = ERROR_INVALIDCMD;
+                self.stat = DISK_ERROR;
             }
         }
 

@@ -6,24 +6,66 @@ pub mod registers;
 use crate::bus::Bus;
 use registers::Registers;
 
+// Ring buffer trace for parity debugging
+const TRACE_SIZE: usize = 64;
+
+#[derive(Clone, Copy, Default)]
+pub struct TraceEntry {
+    pub pc: u32,
+    pub instr: u32,
+    pub t9: u32,      // $25
+    pub ra: u32,      // $31
+    pub k0: u32,      // $26
+    pub k1: u32,      // $27
+    pub sp: u32,      // $29
+    pub status: u32,
+    pub epc: u32,
+    pub in_ds: bool,
+}
+
+pub static mut TRACE_BUF: [TraceEntry; TRACE_SIZE] = [TraceEntry {
+    pc: 0, instr: 0, t9: 0, ra: 0, k0: 0, k1: 0, sp: 0, status: 0, epc: 0, in_ds: false,
+}; TRACE_SIZE];
+pub static mut TRACE_POS: usize = 0;
+pub static mut TRACE_DUMPED: bool = false;
+
+pub fn dump_trace_ring() {
+    unsafe {
+        if TRACE_DUMPED { return; }
+        TRACE_DUMPED = true;
+        eprintln!("\n=== TRACE RING (last {} instructions before crash) ===", TRACE_SIZE);
+        eprintln!("{:<10} {:<10} {:<5} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "PC", "INSTR", "DS", "t9", "ra", "k0", "sp", "STATUS", "EPC");
+        for i in 0..TRACE_SIZE {
+            let idx = (TRACE_POS + i) % TRACE_SIZE;
+            let e = &TRACE_BUF[idx];
+            if e.pc == 0 && e.instr == 0 { continue; }
+            eprintln!("{:08X}  {:08X}  {:<5} {:08X}  {:08X}  {:08X}  {:08X}  {:08X}  {:08X}",
+                e.pc, e.instr, if e.in_ds { "DS" } else { "" },
+                e.t9, e.ra, e.k0, e.sp, e.status, e.epc);
+        }
+        eprintln!("=== END TRACE ===\n");
+    }
+}
+
 pub struct Cpu {
     pub regs: Registers,
     pub icache_addr: [u32; 1024], // 4KB / 4 bytes = 1024 word entries
     pub icache_code: [u32; 1024],
-    delayed_load: [DelayedLoadSlot; 2],
-    current_delayed_load: usize,
+    pub delayed_load: [DelayedLoadSlot; 2],
+    pub current_delayed_load: usize,
     pub in_delay_slot: bool,
     pub next_is_delay_slot: bool,
 }
 
 #[derive(Clone, Copy, Default)]
-struct DelayedLoadSlot {
-    index: u32,
-    value: u32,
-    mask: u32,
-    pc_value: u32,
-    active: bool,
-    pc_active: bool,
+pub struct DelayedLoadSlot {
+    pub index: u32,
+    pub value: u32,
+    pub mask: u32,
+    pub pc_value: u32,
+    pub active: bool,
+    pub pc_active: bool,
 }
 
 impl Cpu {
@@ -63,6 +105,9 @@ impl Cpu {
         self.regs.current_instruction = code;
         self.regs.pc = pc.wrapping_add(4);
         self.regs.cycle += 2; // BIAS
+
+        // Update bus cycle before execute so timer writes see current cycle
+        bus.last_cycle = self.regs.cycle;
 
         self.execute(bus, code);
 
@@ -131,16 +176,37 @@ impl Cpu {
         self.delayed_pc_load(target);
     }
 
-    fn intercept_bios(&self, _bus: &mut Bus) {
+    fn intercept_bios(&self, bus: &mut Bus) {
         let pc = self.regs.pc;
-        let call = self.regs.gpr[9]; // t1 = function number
+        let call = self.regs.gpr[9] & 0xFF; // t1 = function number
         match pc {
             0xA0 => {
                 match call {
-                    0x3C | 0x3E => {
+                    0x03 => {
+                        // write(a0=fd, a1=buf, a2=len)
+                        if self.regs.gpr[4] == 1 { // stdout only
+                            let mut addr = self.regs.gpr[5];
+                            let len = self.regs.gpr[6];
+                            for _ in 0..len {
+                                let ch = bus.read8(addr);
+                                if ch.is_ascii() && ch != 0 { eprint!("{}", ch as char); }
+                                addr = addr.wrapping_add(1);
+                            }
+                        }
+                    }
+                    0x09 | 0x3C => {
+                        // putc / putchar
                         let ch = self.regs.gpr[4] as u8;
-                        if ch.is_ascii() && ch != 0 {
-                            eprint!("{}", ch as char);
+                        if ch.is_ascii() && ch != 0 { eprint!("{}", ch as char); }
+                    }
+                    0x3E => {
+                        // puts(a0=string_ptr) — read string from memory
+                        let mut addr = self.regs.gpr[4];
+                        for _ in 0..1024 {
+                            let ch = bus.read8(addr);
+                            if ch == 0 { break; }
+                            if ch.is_ascii() { eprint!("{}", ch as char); }
+                            addr = addr.wrapping_add(1);
                         }
                     }
                     _ => {
@@ -152,10 +218,31 @@ impl Cpu {
             }
             0xB0 => {
                 match call {
-                    0x3D | 0x3F => {
+                    0x35 => {
+                        // write(a0=fd, a1=buf, a2=len)
+                        if self.regs.gpr[4] == 1 {
+                            let mut addr = self.regs.gpr[5];
+                            let len = self.regs.gpr[6];
+                            for _ in 0..len {
+                                let ch = bus.read8(addr);
+                                if ch.is_ascii() && ch != 0 { eprint!("{}", ch as char); }
+                                addr = addr.wrapping_add(1);
+                            }
+                        }
+                    }
+                    0x3B | 0x3D => {
+                        // putc / putchar
                         let ch = self.regs.gpr[4] as u8;
-                        if ch.is_ascii() && ch != 0 {
-                            eprint!("{}", ch as char);
+                        if ch.is_ascii() && ch != 0 { eprint!("{}", ch as char); }
+                    }
+                    0x3F => {
+                        // puts(a0=string_ptr)
+                        let mut addr = self.regs.gpr[4];
+                        for _ in 0..1024 {
+                            let ch = bus.read8(addr);
+                            if ch == 0 { break; }
+                            if ch.is_ascii() { eprint!("{}", ch as char); }
+                            addr = addr.wrapping_add(1);
                         }
                     }
                     _ => {
@@ -166,7 +253,8 @@ impl Cpu {
                 }
             }
             0xC0 => {
-                tracing::debug!("BIOS C0({:02X}) ra={:08X}", call, self.regs.gpr[31]);
+                tracing::debug!("BIOS C0({:02X}) a0={:08X} a1={:08X} a2={:08X} ra={:08X}",
+                    call, self.regs.gpr[4], self.regs.gpr[5], self.regs.gpr[6], self.regs.gpr[31]);
             }
             _ => {}
         }
@@ -174,14 +262,30 @@ impl Cpu {
 
     /// Software interrupt test — matching Redux psxTestSWInts().
     /// Called after MTC0 to Status/Cause and after RFE.
-    /// Checks if SW interrupt bits in Cause match enabled bits in Status.
-    pub fn test_sw_ints(&mut self, _bus: &mut Bus) {
+    pub fn test_sw_ints(&mut self, bus: &mut Bus) {
         if self.regs.cp0[registers::CP0_CAUSE] & self.regs.cp0[registers::CP0_STATUS] & 0x0300 != 0
             && self.regs.cp0[registers::CP0_STATUS] & 0x1 != 0
         {
-            let in_delay = self.in_delay_slot;
+            let in_delay_slot = self.in_delay_slot;
             self.in_delay_slot = false;
-            exceptions::exception_raw(self, self.regs.cp0[registers::CP0_CAUSE]);
+            exceptions::exception_raw(self, self.regs.cp0[registers::CP0_CAUSE], in_delay_slot);
+            return; // SW interrupt fired — don't also fire HW
+        }
+
+        // Hardware interrupt check — on real R3000A, a pending unmasked IRQ
+        // fires at the next instruction boundary after IEc is enabled.
+        // Since we only check HW IRQs at branch boundaries (branch_test),
+        // MTC0 / RFE enabling IEc can miss the delivery window.
+        // This extends the check to Status-modifying instructions.
+        let status = self.regs.cp0[registers::CP0_STATUS];
+        if (status & 0x401) == 0x401 {
+            let istat = bus.read_istat();
+            let imask = bus.read_imask();
+            if (istat & imask) != 0 {
+                let in_delay_slot = self.in_delay_slot;
+                self.in_delay_slot = false;
+                exceptions::exception_raw(self, 0x400, in_delay_slot);
+            }
         }
     }
 
@@ -189,28 +293,28 @@ impl Cpu {
         let cycle = self.regs.cycle;
         bus.last_cycle = cycle;
 
-        // Update timers — check if VBlank fires
-        let vblank = bus.timers.update(cycle, &mut bus.scheduler);
-        if vblank {
-            bus.set_irq(0); // IRQ0 = VBlank
+        // Update counters — matching Redux branchTest() counter check
+        if cycle >= bus.timers.next_counter {
+            bus.timers.update(cycle);
+            bus.drain_timer_irqs();
         }
 
-        // Check scheduled interrupts
+        // Check scheduled interrupts (SIO, CDROM, DMA, etc.)
         if bus.scheduler.interrupt_flags != 0 && bus.scheduler.lowest_target <= cycle {
             let fired = bus.scheduler.check_interrupts(cycle);
             bus.handle_fired_interrupts(fired);
         }
 
         // Check if any hardware interrupt is pending and enabled
-        // Matching Redux branchTest() lines 401-417
+        // Matching Redux branchTest() lines 404-417
         let istat = bus.read_istat();
         let imask = bus.read_imask();
+
         if (istat & imask) != 0
             && (self.regs.cp0[registers::CP0_STATUS] & 0x401) == 0x401
         {
-            // Fire interrupt exception with Cause = 0x400 (IP2 + ExcCode=0)
-            // Matching Redux: exception(0x400, 0)
-            exceptions::exception_raw(self, 0x400);
+            // Fire interrupt exception — matching Redux: exception(0x400, 0)
+            exceptions::exception_raw(self, 0x400, false);
         }
     }
 }

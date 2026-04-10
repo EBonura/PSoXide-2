@@ -22,11 +22,10 @@ impl Spu {
         let idx = (offset as usize / 2) & 0x1FF;
         match offset {
             0x1AE => {
-                // SPUSTAT: mirror SPUCNT bits [5:0], plus idle flags
-                // Bit 10: Data Transfer Busy (0 = idle — what BIOS waits for)
-                // Return: lower 6 bits from SPUCNT, transfer not busy
-                let cnt = self.regs[SPUCNT];
-                (cnt & 0x3F) // transfer idle (bit 10 = 0)
+                // SPUSTAT — return 0 (fully idle).
+                // Redux's full SPU would process transfers and reflect real state.
+                // Our stub treats everything as instantly complete.
+                0
             }
             _ => self.regs[idx],
         }
@@ -38,12 +37,11 @@ impl Spu {
 
         match offset {
             0x1AA => {
-                // SPUCNT — update SPUSTAT to mirror
-                // Nothing special needed; SPUSTAT read computes dynamically
-            }
-            0x1AC => {
-                // Transfer Control — BIOS writes here then polls SPUSTAT
-                // We treat transfers as instant (no busy flag)
+                // SPUCNT write — auto-clear transfer mode bits (5-4) to simulate
+                // instant transfer completion. On real hardware / Redux, the SPU
+                // processes the transfer and clears these. Without this, SPUSTAT
+                // mirrors the transfer mode forever and the BIOS times out polling.
+                self.regs[SPUCNT] = value & !0x30;
             }
             _ => {}
         }

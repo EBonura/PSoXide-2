@@ -25,6 +25,16 @@ pub struct CommandProcessor {
     pub mask_set: bool,
     pub mask_check: bool,
     pub texture_window: u32,
+    // GP1(0x10) query readback — returned by read_data when no VRAM transfer active
+    pub data_ret: u32,
+    // Raw register values for GP1(0x10) queries
+    pub texture_window_raw: u32,
+    pub draw_area_start_raw: u32,
+    pub draw_area_end_raw: u32,
+    pub draw_offset_raw: u32,
+    // Instrumentation
+    pub gp0_count: u32,
+    pub gp1_count: u32,
 }
 
 impl CommandProcessor {
@@ -42,10 +52,18 @@ impl CommandProcessor {
             mask_set: false,
             mask_check: false,
             texture_window: 0,
+            data_ret: 0x400,
+            texture_window_raw: 0,
+            draw_area_start_raw: 0,
+            draw_area_end_raw: 0,
+            draw_offset_raw: 0,
+            gp0_count: 0,
+            gp1_count: 0,
         }
     }
 
     pub fn gp0_write(&mut self, vram: &mut Vram, status: &mut GpuStatus, display: &mut DisplayConfig, data: u32) {
+        self.gp0_count += 1;
         match self.state {
             GpuState::Idle => self.gp0_command(vram, status, display, data),
             GpuState::ReceivingCommand { cmd, words_remaining } => {
@@ -163,21 +181,25 @@ impl CommandProcessor {
             0xE2 => {
                 // Texture window
                 self.texture_window = data;
+                self.texture_window_raw = data & 0xFFFFF;
             }
             0xE3 => {
                 // Draw area top-left
                 self.draw_area_left = (data & 0x3FF) as i16;
                 self.draw_area_top = ((data >> 10) & 0x1FF) as i16;
+                self.draw_area_start_raw = data & 0x7FFFF;
             }
             0xE4 => {
                 // Draw area bottom-right
                 self.draw_area_right = (data & 0x3FF) as i16;
                 self.draw_area_bottom = ((data >> 10) & 0x1FF) as i16;
+                self.draw_area_end_raw = data & 0x7FFFF;
             }
             0xE5 => {
                 // Draw offset
                 self.draw_offset_x = ((data & 0x7FF) as i16) << 5 >> 5; // sign-extend 11-bit
                 self.draw_offset_y = (((data >> 11) & 0x7FF) as i16) << 5 >> 5;
+                self.draw_offset_raw = data & 0x3FFFFF;
             }
             0xE6 => {
                 // Mask bit setting
@@ -345,10 +367,11 @@ impl CommandProcessor {
     }
 
     pub fn gp1_write(&mut self, vram: &mut Vram, status: &mut GpuStatus, display: &mut DisplayConfig, data: u32) {
+        self.gp1_count += 1;
         let cmd = (data >> 24) as u8;
         match cmd {
             0x00 => {
-                // Reset GPU
+                // Reset GPU — matching Redux writeStatus case 0
                 *status = GpuStatus::new();
                 *display = DisplayConfig::new();
                 self.state = GpuState::Idle;
@@ -360,6 +383,11 @@ impl CommandProcessor {
                 self.draw_area_bottom = 0;
                 self.draw_offset_x = 0;
                 self.draw_offset_y = 0;
+                self.texture_window_raw = 0;
+                self.draw_area_start_raw = 0;
+                self.draw_area_end_raw = 0;
+                self.draw_offset_raw = 0;
+                self.data_ret = 0x400;
                 tracing::debug!("GP1 reset");
             }
             0x01 => {
@@ -414,8 +442,16 @@ impl CommandProcessor {
                 status.raw = (status.raw & !0x7F4000) | ((data & 0x3F) << 17) | ((data & 0x40) << 10);
             }
             0x10 => {
-                // Get GPU info
-                tracing::trace!("GP1 get info: {:02X}", data & 0xF);
+                // Get GPU info — matching Redux writeStatus case 16 + write1(CtrlQuery)
+                // Query type from bits 0-2, mapped: 2=TexWindow, 3=DrawStart, 4=DrawEnd, 5=DrawOffset
+                let query = data & 0x07;
+                match query {
+                    2 => self.data_ret = self.texture_window_raw,
+                    3 => self.data_ret = self.draw_area_start_raw,
+                    4 => self.data_ret = self.draw_area_end_raw,
+                    5 => self.data_ret = self.draw_offset_raw,
+                    _ => {} // queries 0, 1, 6, 7 are unknown — leave data_ret unchanged
+                }
             }
             _ => {
                 tracing::trace!("GP1 unhandled command: {:02X} data={:08X}", cmd, data);
@@ -445,7 +481,7 @@ impl CommandProcessor {
                 }
                 result
             }
-            _ => 0,
+            _ => self.data_ret,
         }
     }
 }

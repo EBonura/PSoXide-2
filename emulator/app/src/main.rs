@@ -300,8 +300,7 @@ fn main() -> Result<()> {
     // CLI args override config file
     let bios = args.bios.or(cfg.bios)
         .ok_or_else(|| anyhow::anyhow!(
-            "No BIOS path. Pass --bios or set it in {:?}",
-            dirs::config_dir().unwrap_or_default().join("psoxide-2/config.toml")
+            "No BIOS path. Pass --bios or set it in config.toml"
         ))?;
     let _game = args.game.or(cfg.game);
 

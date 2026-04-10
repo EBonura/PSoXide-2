@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/core",
-    "crates/gpu",
-    "crates/spu",
-    "crates/cdrom",
-    "crates/app",
+    "emulator/*",
+]
+exclude = [
+    "sdk",
+    "editor",
+    "shared",
 ]
 
 [workspace.package]

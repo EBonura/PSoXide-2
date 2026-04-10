@@ -437,6 +437,10 @@ impl CdRom {
         }
     }
 
+    pub fn read_ctrl_drq(&self) -> bool {
+        self.ctrl & DRQSTS != 0
+    }
+
     pub fn dma_read(&mut self, dest: &mut [u8]) {
         if !self.read { return; }
         for byte in dest.iter_mut() {

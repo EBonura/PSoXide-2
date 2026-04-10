@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod command_buffer;
 pub mod display;
+pub mod rasterizer;
 pub mod status;
 pub mod vram;
 

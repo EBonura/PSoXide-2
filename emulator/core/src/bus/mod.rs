@@ -1,6 +1,7 @@
 pub mod dma;
 
 use crate::scheduler::Scheduler;
+use crate::sio::Sio;
 use crate::timers::Timers;
 use cdrom::CdRom;
 use gpu::Gpu;
@@ -17,6 +18,7 @@ pub struct Bus {
     pub cdrom: CdRom,
     pub timers: Timers,
     pub scheduler: Scheduler,
+    pub sio: Sio,
     pub dma: dma::DmaController,
     pub last_cycle: u64,
 }
@@ -33,6 +35,7 @@ impl Bus {
             cdrom: CdRom::new(),
             timers: Timers::new(),
             scheduler: Scheduler::new(),
+            sio: Sio::new(),
             dma: dma::DmaController::new(),
             last_cycle: 0,
         }
@@ -219,12 +222,12 @@ impl Bus {
     fn hw_read16(&mut self, phys: u32) -> u16 {
         let offset = phys & 0xFFFF;
         match offset {
-            // Joypad/SIO
-            0x1040 => 0xFF, // RX data (no controller)
-            0x1044 => 0x0005, // SIO status: TX ready, TX empty
-            0x1048 => 0, // SIO mode
-            0x104A => 0, // SIO control
-            0x104E => 0, // SIO baud
+            // SIO0 (controller/memory card)
+            0x1040 => { let b = self.sio.read8(); b as u16 | ((self.sio.read8() as u16) << 8) }
+            0x1044 => self.sio.read_status16(),
+            0x1048 => self.sio.read_mode16(),
+            0x104A => self.sio.read_ctrl16(),
+            0x104E => self.sio.read_baud16(),
 
             // Interrupt
             0x1070 => self.read_hw_reg16(offset),
@@ -257,9 +260,15 @@ impl Bus {
     fn hw_read32(&mut self, phys: u32) -> u32 {
         let offset = phys & 0xFFFF;
         match offset {
-            // Joypad
-            0x1040 => 0xFFFF_FFFF, // RX data (no controller connected)
-            0x1044 => 0x0000_0005, // SIO status
+            // SIO0
+            0x1040 => {
+                let b0 = self.sio.read8() as u32;
+                let b1 = self.sio.read8() as u32;
+                let b2 = self.sio.read8() as u32;
+                let b3 = self.sio.read8() as u32;
+                b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+            }
+            0x1044 => self.sio.read_status32(),
 
             // Interrupt
             0x1070 => self.read_hw_reg32(offset),
@@ -324,11 +333,14 @@ impl Bus {
     fn hw_write16(&mut self, phys: u32, value: u16) {
         let offset = phys & 0xFFFF;
         match offset {
-            // Joypad/SIO
-            0x1040..=0x104E => {
-                tracing::trace!("SIO write16: {:04X} = {:04X}", offset, value);
-                self.write_hw_reg16(offset, value);
+            // SIO0
+            0x1040 => self.sio.write8(value as u8),
+            0x1048 => self.sio.write_mode16(value),
+            0x104A => {
+                self.sio.write_ctrl16(value);
+                self.drain_sio_irq();
             }
+            0x104E => self.sio.write_baud16(value),
 
             // Interrupt
             0x1070 => {
@@ -365,11 +377,14 @@ impl Bus {
     fn hw_write32(&mut self, phys: u32, value: u32) {
         let offset = phys & 0xFFFF;
         match offset {
-            // Joypad
-            0x1040..=0x104E => {
-                tracing::trace!("SIO write32: {:04X} = {:08X}", offset, value);
-                self.write_hw_reg32(offset, value);
+            // SIO0
+            0x1040 => self.sio.write8(value as u8),
+            0x1048 => self.sio.write_mode16(value as u16),
+            0x104A => {
+                self.sio.write_ctrl16(value as u16);
+                self.drain_sio_irq();
             }
+            0x104E => self.sio.write_baud16(value as u16),
 
             // Interrupt
             0x1070 => {
@@ -500,6 +515,11 @@ impl Bus {
                 continue;
             }
             match i {
+                // PSXINT_SIO = 0 -> SIO interrupt
+                0 => {
+                    self.sio.interrupt();
+                    self.set_irq(7); // IRQ7 = SIO0
+                }
                 // PSXINT_CDR = 2 -> CD-ROM command interrupt
                 2 => {
                     let hw = &mut self.hw_regs;
@@ -529,6 +549,15 @@ impl Bus {
                 }
                 _ => tracing::trace!("Scheduler fired interrupt {} (unhandled)", i),
             }
+        }
+    }
+
+    /// Drain SIO pending interrupt into scheduler
+    fn drain_sio_irq(&mut self) {
+        if self.sio.pending_irq {
+            self.sio.pending_irq = false;
+            let delay = self.sio.pending_irq_delay;
+            self.scheduler.schedule(crate::scheduler::PsxInt::Sio, self.last_cycle, delay);
         }
     }
 
@@ -568,12 +597,21 @@ impl Bus {
         tracing::debug!("DMA ch{} exec: MADR={:08X} BCR={:08X} CHCR={:08X}", channel, madr, bcr, chcr);
 
         match channel {
+            0 => dma::dma_mdec_in(self, madr, bcr, chcr),
+            1 => dma::dma_mdec_out(self, madr, bcr, chcr),
             2 => dma::dma_gpu(self, madr, bcr, chcr),
+            3 => dma::dma_cdrom(self, madr, bcr, chcr),
+            4 => dma::dma_spu(self, madr, bcr, chcr),
             6 => dma::dma_otc(self, madr, bcr, chcr),
             _ => {
                 tracing::warn!("DMA channel {} not implemented", channel);
             }
         }
+    }
+
+    pub fn cdrom_has_data(&self) -> bool {
+        // Check DRQSTS flag in cdrom ctrl
+        self.cdrom.read_ctrl_drq()
     }
 
     pub fn dma_gpu_interrupt(&mut self) {

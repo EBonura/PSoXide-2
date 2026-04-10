@@ -1,4 +1,5 @@
 use crate::display::DisplayConfig;
+use crate::rasterizer::{DrawArea, Rasterizer};
 use crate::status::GpuStatus;
 use crate::vram::Vram;
 
@@ -192,33 +193,28 @@ impl CommandProcessor {
         }
     }
 
+    fn draw_area(&self) -> DrawArea {
+        DrawArea {
+            left: self.draw_area_left as i32,
+            top: self.draw_area_top as i32,
+            right: self.draw_area_right as i32,
+            bottom: self.draw_area_bottom as i32,
+        }
+    }
+
+    fn offset(&self) -> (i16, i16) {
+        (self.draw_offset_x, self.draw_offset_y)
+    }
+
     fn execute_command(&mut self, vram: &mut Vram, cmd: u8) {
-        let buf = &self.command_buffer;
+        let rast = Rasterizer::new(1); // native resolution
+        let buf = self.command_buffer.clone(); // clone to avoid borrow conflict
+        let da = self.draw_area();
+        let off = self.offset();
+
         match cmd {
             // Fill rectangle
-            0x02 => {
-                let color = buf[0] & 0xFF_FFFF;
-                let xy = buf[1];
-                let wh = buf[2];
-                let x = (xy & 0x3F0) as u16; // aligned to 16 pixels
-                let y = ((xy >> 16) & 0x1FF) as u16;
-                let w = (((wh & 0x3FF) + 0xF) & !0xF) as u16; // rounded to 16
-                let h = ((wh >> 16) & 0x1FF) as u16;
-
-                let r = (color & 0xFF) as u8;
-                let g = ((color >> 8) & 0xFF) as u8;
-                let b = ((color >> 16) & 0xFF) as u8;
-                let pixel = ((r as u16 >> 3) & 0x1F)
-                    | (((g as u16 >> 3) & 0x1F) << 5)
-                    | (((b as u16 >> 3) & 0x1F) << 10);
-
-                for py in y..y + h {
-                    for px in x..x + w {
-                        vram.set_pixel(px, py, pixel);
-                    }
-                }
-                tracing::trace!("GP0 fill rect: ({},{}) {}x{} color={:06X}", x, y, w, h, color);
-            }
+            0x02 => rast.fill_rect(vram, buf[0], buf[1], buf[2]),
 
             // CPU -> VRAM
             0xA0 => {
@@ -226,12 +222,8 @@ impl CommandProcessor {
                 let wh = buf[2];
                 let x = (xy & 0x3FF) as u16;
                 let y = ((xy >> 16) & 0x1FF) as u16;
-                let w = (wh & 0xFFFF) as u16;
-                let h = ((wh >> 16) & 0xFFFF) as u16;
-                let w = if w == 0 { 1024 } else { w };
-                let h = if h == 0 { 512 } else { h };
-
-                tracing::trace!("GP0 CPU->VRAM: ({},{}) {}x{}", x, y, w, h);
+                let w = if wh & 0xFFFF == 0 { 1024u16 } else { (wh & 0xFFFF) as u16 };
+                let h = if (wh >> 16) & 0xFFFF == 0 { 512u16 } else { ((wh >> 16) & 0xFFFF) as u16 };
                 self.state = GpuState::CpuToVram { x, y, w, h, current_x: 0, current_y: 0 };
             }
 
@@ -241,50 +233,110 @@ impl CommandProcessor {
                 let wh = buf[2];
                 let x = (xy & 0x3FF) as u16;
                 let y = ((xy >> 16) & 0x1FF) as u16;
-                let w = (wh & 0xFFFF) as u16;
-                let h = ((wh >> 16) & 0xFFFF) as u16;
-                let w = if w == 0 { 1024 } else { w };
-                let h = if h == 0 { 512 } else { h };
-
-                tracing::trace!("GP0 VRAM->CPU: ({},{}) {}x{}", x, y, w, h);
+                let w = if wh & 0xFFFF == 0 { 1024u16 } else { (wh & 0xFFFF) as u16 };
+                let h = if (wh >> 16) & 0xFFFF == 0 { 512u16 } else { ((wh >> 16) & 0xFFFF) as u16 };
                 self.state = GpuState::VramToCpu { x, y, w, h, current_x: 0, current_y: 0 };
             }
 
             // VRAM -> VRAM
             0x80 => {
-                let src_xy = buf[1];
-                let dst_xy = buf[2];
-                let wh = buf[3];
-                let sx = (src_xy & 0x3FF) as u16;
-                let sy = ((src_xy >> 16) & 0x1FF) as u16;
-                let dx = (dst_xy & 0x3FF) as u16;
-                let dy = ((dst_xy >> 16) & 0x1FF) as u16;
-                let w = (wh & 0xFFFF) as u16;
-                let h = ((wh >> 16) & 0xFFFF) as u16;
-
-                for py in 0..h {
-                    for px in 0..w {
-                        let pixel = vram.get_pixel(sx + px, sy + py);
-                        vram.set_pixel(dx + px, dy + py, pixel);
-                    }
-                }
-                tracing::trace!("GP0 VRAM->VRAM: ({},{})->({},{}) {}x{}", sx, sy, dx, dy, w, h);
+                let (sx, sy) = ((buf[1] & 0x3FF) as u16, ((buf[1] >> 16) & 0x1FF) as u16);
+                let (dx, dy) = ((buf[2] & 0x3FF) as u16, ((buf[2] >> 16) & 0x1FF) as u16);
+                let (w, h) = ((buf[3] & 0xFFFF) as u16, ((buf[3] >> 16) & 0xFFFF) as u16);
+                for py in 0..h { for px in 0..w {
+                    let p = vram.get_pixel(sx + px, sy + py);
+                    vram.set_pixel(dx + px, dy + py, p);
+                }}
             }
 
-            // Polygons — stub: just log for now (rasterizer comes in Phase 2)
-            0x20..=0x3F => {
-                tracing::trace!("GP0 polygon cmd {:02X} ({} words)", cmd, buf.len());
+            // === Polygons ===
+            // Flat tri
+            0x20 | 0x22 => rast.flat_triangle(vram, buf[0], buf[1], buf[2], buf[3], &da, off),
+            // Flat quad
+            0x28 | 0x2A => rast.flat_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], &da, off),
+            // Textured tri
+            0x24 | 0x26 => {
+                // For now, draw flat with the command color (texture lookup TODO for accuracy)
+                rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off);
             }
+            // Textured quad
+            0x2C | 0x2E => {
+                rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off);
+                rast.flat_triangle(vram, buf[0], buf[3], buf[5], buf[7], &da, off);
+            }
+            // Gouraud tri
+            0x30 | 0x32 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], &da, off),
+            // Gouraud quad
+            0x38 | 0x3A => rast.gouraud_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], &da, off),
+            // Gouraud-textured tri
+            0x34 | 0x36 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], &da, off),
+            // Gouraud-textured quad
+            0x3C | 0x3E => rast.gouraud_quad(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], buf[9], buf[10], &da, off),
+            // Semi-transparent variants (same geometry, blend mode differs)
+            0x21 | 0x23 => rast.flat_triangle(vram, buf[0], buf[1], buf[2], buf[3], &da, off),
+            0x29 | 0x2B => rast.flat_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], &da, off),
+            0x25 | 0x27 => rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off),
+            0x2D | 0x2F => {
+                rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off);
+                rast.flat_triangle(vram, buf[0], buf[3], buf[5], buf[7], &da, off);
+            }
+            0x31 | 0x33 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], &da, off),
+            0x39 | 0x3B => rast.gouraud_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], &da, off),
+            0x35 | 0x37 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], &da, off),
+            0x3D | 0x3F => rast.gouraud_quad(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], buf[9], buf[10], &da, off),
 
-            // Lines — stub
+            // === Lines ===
             0x40..=0x5F => {
-                tracing::trace!("GP0 line cmd {:02X}", cmd);
+                // Flat line: draw as a 1-pixel-wide rect between two points
+                // Stub for now — lines are rare in BIOS
+                tracing::trace!("GP0 line {:02X}", cmd);
             }
 
-            // Rectangles — stub
-            0x60..=0x7F => {
-                tracing::trace!("GP0 rect cmd {:02X}", cmd);
+            // === Rectangles/Sprites ===
+            0x60 | 0x62 => {
+                // Variable-size flat rect
+                let (w, h) = ((buf[2] & 0xFFFF) as i32, ((buf[2] >> 16) & 0xFFFF) as i32);
+                rast.flat_rect(vram, buf[0], buf[1], w, h, &da, off);
             }
+            0x64 | 0x66 => {
+                // Variable-size textured rect
+                let (w, h) = ((buf[3] & 0xFFFF) as i32, ((buf[3] >> 16) & 0xFFFF) as i32);
+                rast.textured_rect(vram, buf[0], buf[1], buf[2], w, h, self.texpage, &da, off);
+            }
+            0x68 | 0x6A => {
+                // 1x1 dot
+                rast.flat_rect(vram, buf[0], buf[1], 1, 1, &da, off);
+            }
+            0x70 | 0x72 => {
+                // 8x8 flat rect
+                rast.flat_rect(vram, buf[0], buf[1], 8, 8, &da, off);
+            }
+            0x74 | 0x76 => {
+                // 8x8 textured sprite
+                rast.textured_rect(vram, buf[0], buf[1], buf[2], 8, 8, self.texpage, &da, off);
+            }
+            0x78 | 0x7A => {
+                // 16x16 flat rect
+                rast.flat_rect(vram, buf[0], buf[1], 16, 16, &da, off);
+            }
+            0x7C | 0x7E => {
+                // 16x16 textured sprite
+                rast.textured_rect(vram, buf[0], buf[1], buf[2], 16, 16, self.texpage, &da, off);
+            }
+            // Semi-transparent rect variants
+            0x61 | 0x63 => {
+                let (w, h) = ((buf[2] & 0xFFFF) as i32, ((buf[2] >> 16) & 0xFFFF) as i32);
+                rast.flat_rect(vram, buf[0], buf[1], w, h, &da, off);
+            }
+            0x65 | 0x67 => {
+                let (w, h) = ((buf[3] & 0xFFFF) as i32, ((buf[3] >> 16) & 0xFFFF) as i32);
+                rast.textured_rect(vram, buf[0], buf[1], buf[2], w, h, self.texpage, &da, off);
+            }
+            0x69 | 0x6B => rast.flat_rect(vram, buf[0], buf[1], 1, 1, &da, off),
+            0x71 | 0x73 => rast.flat_rect(vram, buf[0], buf[1], 8, 8, &da, off),
+            0x75 | 0x77 => rast.textured_rect(vram, buf[0], buf[1], buf[2], 8, 8, self.texpage, &da, off),
+            0x79 | 0x7B => rast.flat_rect(vram, buf[0], buf[1], 16, 16, &da, off),
+            0x7D | 0x7F => rast.textured_rect(vram, buf[0], buf[1], buf[2], 16, 16, self.texpage, &da, off),
 
             _ => {
                 tracing::trace!("GP0 execute unhandled cmd {:02X}", cmd);

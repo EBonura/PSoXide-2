@@ -484,14 +484,12 @@ impl Cpu {
     fn op_lb(&mut self, bus: &mut Bus, code: u32) {
         let addr = self.regs.gpr[rs(code)].wrapping_add(imm_se(code));
         let val = bus.read8(addr) as i8 as i32 as u32;
-        self.cancel_delayed_load(rt(code) as u32);
         self.delayed_load(rt(code) as u32, val);
     }
 
     fn op_lbu(&mut self, bus: &mut Bus, code: u32) {
         let addr = self.regs.gpr[rs(code)].wrapping_add(imm_se(code));
         let val = bus.read8(addr) as u32;
-        self.cancel_delayed_load(rt(code) as u32);
         self.delayed_load(rt(code) as u32, val);
     }
 
@@ -503,7 +501,6 @@ impl Cpu {
             return;
         }
         let val = bus.read16(addr) as i16 as i32 as u32;
-        self.cancel_delayed_load(rt(code) as u32);
         self.delayed_load(rt(code) as u32, val);
     }
 
@@ -515,7 +512,6 @@ impl Cpu {
             return;
         }
         let val = bus.read16(addr) as u32;
-        self.cancel_delayed_load(rt(code) as u32);
         self.delayed_load(rt(code) as u32, val);
     }
 
@@ -527,7 +523,6 @@ impl Cpu {
             return;
         }
         let val = bus.read32(addr);
-        self.cancel_delayed_load(rt(code) as u32);
         self.delayed_load(rt(code) as u32, val);
     }
 
@@ -555,7 +550,6 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        self.cancel_delayed_load(rt_idx as u32);
         self.delayed_load_masked(rt_idx as u32, result & !mask, mask);
     }
 
@@ -582,7 +576,6 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        self.cancel_delayed_load(rt_idx as u32);
         self.delayed_load_masked(rt_idx as u32, result & !mask, mask);
     }
 

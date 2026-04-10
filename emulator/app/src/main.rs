@@ -269,6 +269,9 @@ impl ApplicationHandler for App {
 
                 if self.frame_count % 60 == 0 {
                     let nonzero = self.bus.gpu.vram.data.iter().filter(|&&p| p != 0).count();
+                    eprintln!("frame {:4} | PC={:08X} | VRAM={} | Status={:08X} ISTAT={:08X} IMASK={:08X}",
+                        self.frame_count, self.cpu.regs.pc, nonzero,
+                        self.cpu.regs.cp0[12], self.bus.read_istat(), self.bus.read_imask());
                     if let Some(w) = &self.window {
                         w.set_title(&format!(
                             "PSoXide-2 | frame {} | PC={:08X} | VRAM pixels: {}",

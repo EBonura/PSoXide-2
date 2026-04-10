@@ -187,6 +187,7 @@ impl Cpu {
 
     fn branch_test(&mut self, bus: &mut Bus) {
         let cycle = self.regs.cycle;
+        bus.last_cycle = cycle;
 
         // Update timers — check if VBlank fires
         let vblank = bus.timers.update(cycle, &mut bus.scheduler);

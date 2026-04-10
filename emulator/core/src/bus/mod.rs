@@ -18,6 +18,7 @@ pub struct Bus {
     pub timers: Timers,
     pub scheduler: Scheduler,
     pub dma: dma::DmaController,
+    pub last_cycle: u64,
 }
 
 impl Bus {
@@ -33,6 +34,7 @@ impl Bus {
             timers: Timers::new(),
             scheduler: Scheduler::new(),
             dma: dma::DmaController::new(),
+            last_cycle: 0,
         }
     }
 
@@ -301,7 +303,17 @@ impl Bus {
         let offset = phys & 0xFFFF;
         match offset {
             // CD-ROM
-            0x1800..=0x1803 => self.cdrom.write(offset - 0x1800, value),
+            0x1800..=0x1803 => {
+                let hw_regs = &mut self.hw_regs;
+                self.cdrom.write(offset - 0x1800, value, &mut |bit| {
+                    // set_irq inline — can't call self.set_irq due to borrow
+                    let off = 0x1070usize;
+                    let istat = u32::from_le_bytes([hw_regs[off], hw_regs[off+1], hw_regs[off+2], hw_regs[off+3]]);
+                    let new_istat = istat | (1 << bit);
+                    hw_regs[off..off+4].copy_from_slice(&new_istat.to_le_bytes());
+                });
+                self.drain_cdrom_irqs();
+            }
             _ => {
                 tracing::trace!("HW write8: {:04X} = {:02X}", offset, value);
                 self.hw_regs[offset as usize] = value;
@@ -488,12 +500,52 @@ impl Bus {
                 continue;
             }
             match i {
-                2 => self.set_irq(4),  // CDROM -> IRQ2 (bit 2)... wait, CDROM is IRQ bit 2
-                3 => self.set_irq(2),  // CDROM read
+                // PSXINT_CDR = 2 -> CD-ROM command interrupt
+                2 => {
+                    let hw = &mut self.hw_regs;
+                    self.cdrom.interrupt(&mut |bit| {
+                        let off = 0x1070usize;
+                        let istat = u32::from_le_bytes([hw[off], hw[off+1], hw[off+2], hw[off+3]]);
+                        hw[off..off+4].copy_from_slice(&(istat | (1 << bit)).to_le_bytes());
+                    });
+                    self.drain_cdrom_irqs();
+                }
+                // PSXINT_CDREAD = 3 -> CD-ROM read interrupt
+                3 => {
+                    let hw = &mut self.hw_regs;
+                    self.cdrom.read_interrupt(&mut |bit| {
+                        let off = 0x1070usize;
+                        let istat = u32::from_le_bytes([hw[off], hw[off+1], hw[off+2], hw[off+3]]);
+                        hw[off..off+4].copy_from_slice(&(istat | (1 << bit)).to_le_bytes());
+                    });
+                    self.drain_cdrom_irqs();
+                }
                 4 => self.dma_gpu_interrupt(),
                 9 => self.dma_otc_interrupt(),
+                // PSXINT_CDRLID = 13 -> CD-ROM lid/seek
+                13 => {
+                    self.cdrom.lid_seek_interrupt();
+                    self.drain_cdrom_irqs();
+                }
                 _ => tracing::trace!("Scheduler fired interrupt {} (unhandled)", i),
             }
+        }
+    }
+
+    /// Drain pending CD-ROM interrupt requests into the scheduler
+    fn drain_cdrom_irqs(&mut self) {
+        let irqs: Vec<_> = self.cdrom.pending_irqs.drain(..).collect();
+        let cycle = self.scheduler.int_targets[0]; // approximate current cycle
+        for irq in irqs {
+            use cdrom::CdIrqType;
+            let sched_irq = match irq.irq_type {
+                CdIrqType::Command => crate::scheduler::PsxInt::CdRom,
+                CdIrqType::Read => crate::scheduler::PsxInt::CdRead,
+                CdIrqType::Lid => crate::scheduler::PsxInt::CdRomLid,
+            };
+            // Use a rough current cycle estimate — the caller should pass it, but
+            // for now we store it when branch_test runs
+            self.scheduler.schedule(sched_irq, self.last_cycle, irq.delay);
         }
     }
 

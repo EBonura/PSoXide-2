@@ -119,22 +119,34 @@ impl Cpu {
                 self.cancel_delayed_load(rt(code) as u32);
                 self.delayed_load(rt(code) as u32, val);
             }
-            0x04 => { // MTC0
+            0x02 => { // CFC0
+                let val = self.regs.cp0[rd(code)];
+                self.cancel_delayed_load(rt(code) as u32);
+                self.delayed_load(rt(code) as u32, val);
+            }
+            0x04 | 0x06 => { // MTC0 / CTC0
                 let val = self.regs.gpr[rt(code)];
                 let reg = rd(code);
-                self.regs.cp0[reg] = val;
-
-                // Writing to Status or Cause can trigger pending interrupts
-                if reg == CP0_STATUS || reg == CP0_CAUSE {
-                    // Check for pending interrupts on next branch_test
+                // Matching Redux MTC0(): special handling for Status and Cause
+                match reg {
+                    CP0_STATUS => {
+                        self.regs.cp0[CP0_STATUS] = val;
+                        self.test_sw_ints(bus);
+                    }
+                    CP0_CAUSE => {
+                        // Only bits 8-9 (SW interrupt flags) are writable
+                        self.regs.cp0[CP0_CAUSE] = (self.regs.cp0[CP0_CAUSE] & !0x0300) | (val & 0x0300);
+                        self.test_sw_ints(bus);
+                    }
+                    _ => {
+                        self.regs.cp0[reg] = val;
+                    }
                 }
             }
-            0x10 => { // RFE
-                if funct(code) == 0x10 {
-                    let status = self.regs.cp0[CP0_STATUS];
-                    // Pop the interrupt/kernel mode stack (shift right by 2 positions)
-                    self.regs.cp0[CP0_STATUS] = (status & !0x0F) | ((status >> 2) & 0x0F);
-                }
+            0x10 => { // RFE — matching Redux psxRFE()
+                let status = self.regs.cp0[CP0_STATUS];
+                self.regs.cp0[CP0_STATUS] = (status & 0xFFFF_FFF0) | ((status & 0x3C) >> 2);
+                self.test_sw_ints(bus);
             }
             _ => {
                 tracing::warn!("Unhandled COP0 rs={:02X} at PC {:08X}", rs(code), self.regs.pc.wrapping_sub(4));

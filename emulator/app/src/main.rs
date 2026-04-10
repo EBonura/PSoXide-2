@@ -25,9 +25,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-
     tracing::info!("PSoXide-2 starting");
-    tracing::info!("BIOS: {}", args.bios.display());
 
     let mut bus = Bus::new();
     bus.load_bios(&args.bios)?;
@@ -35,44 +33,27 @@ fn main() -> Result<()> {
     let mut cpu = Cpu::new();
     cpu.reset();
 
-    tracing::info!("Running BIOS...");
-
-    // Run BIOS, detect tight loop and dump it
+    // Run for 3 seconds of PS1 time with debug logging
+    let target_cycles: u64 = 33_868_800 * 3;
     let mut step_count = 0u64;
-    let mut pc_history: Vec<u32> = Vec::new();
 
-    loop {
-        let pc = cpu.regs.pc;
+    while cpu.regs.cycle < target_cycles {
         cpu.step(&mut bus);
         step_count += 1;
 
-        pc_history.push(pc);
-        if pc_history.len() > 100 { pc_history.remove(0); }
-
-        // Report at milestones
-        if step_count % 5_000_000 == 0 {
-            eprintln!("[{:8}] PC={:08X} Status={:08X} ISTAT={:08X} IMASK={:08X} cycle={}",
+        if step_count % 10_000_000 == 0 {
+            eprintln!("[{:10}] PC={:08X} Status={:08X} ISTAT={:08X} IMASK={:08X}",
                 step_count, cpu.regs.pc,
-                cpu.regs.cp0[12], bus.read_istat(), bus.read_imask(), cpu.regs.cycle);
-        }
-
-        if step_count >= 50_000_000 {
-            eprintln!("=== DONE at {} steps, PC={:08X} ===", step_count, cpu.regs.pc);
-            // Dump GPU state
-            eprintln!("GPU: display={}x{} at ({},{})",
-                bus.gpu.display.width(), bus.gpu.display.height(),
-                bus.gpu.display.display_area_x, bus.gpu.display.display_area_y);
-            eprintln!("GPUSTAT: {:08X}", bus.gpu.read_status());
-
-            // Check if VRAM has any non-zero pixels
-            let mut nonzero = 0;
-            for &p in bus.gpu.vram.data.iter() {
-                if p != 0 { nonzero += 1; }
-            }
-            eprintln!("VRAM non-zero pixels: {}", nonzero);
-            break;
+                cpu.regs.cp0[12], bus.read_istat(), bus.read_imask());
         }
     }
+
+    eprintln!("=== {} steps, {} cycles ===", step_count, cpu.regs.cycle);
+    eprintln!("GPU: {}x{} at ({},{}) GPUSTAT={:08X}",
+        bus.gpu.display.width(), bus.gpu.display.height(),
+        bus.gpu.display.display_area_x, bus.gpu.display.display_area_y,
+        bus.gpu.read_status());
+    eprintln!("VRAM non-zero: {}", bus.gpu.vram.data.iter().filter(|&&p| p != 0).count());
 
     Ok(())
 }

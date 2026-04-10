@@ -131,33 +131,57 @@ impl Cpu {
         self.delayed_pc_load(target);
     }
 
-    fn intercept_bios(&self, bus: &mut Bus) {
+    fn intercept_bios(&self, _bus: &mut Bus) {
         let pc = self.regs.pc;
+        let call = self.regs.gpr[9]; // t1 = function number
         match pc {
-            0x000000A0 | 0x000000B0 | 0x000000C0 => {
-                let call = self.regs.gpr[9]; // t1 = function number
-                match pc {
-                    0xA0 => {
-                        if call == 0x3C || call == 0x3E {
-                            // putchar / puts
-                            let ch = self.regs.gpr[4] as u8;
-                            if ch.is_ascii() && ch != 0 {
-                                eprint!("{}", ch as char);
-                            }
+            0xA0 => {
+                match call {
+                    0x3C | 0x3E => {
+                        let ch = self.regs.gpr[4] as u8;
+                        if ch.is_ascii() && ch != 0 {
+                            eprint!("{}", ch as char);
                         }
                     }
-                    0xB0 => {
-                        if call == 0x3D || call == 0x3F {
-                            let ch = self.regs.gpr[4] as u8;
-                            if ch.is_ascii() && ch != 0 {
-                                eprint!("{}", ch as char);
-                            }
-                        }
+                    _ => {
+                        tracing::debug!("BIOS A0({:02X}) a0={:08X} a1={:08X} a2={:08X} ra={:08X}",
+                            call, self.regs.gpr[4], self.regs.gpr[5],
+                            self.regs.gpr[6], self.regs.gpr[31]);
                     }
-                    _ => {}
                 }
             }
+            0xB0 => {
+                match call {
+                    0x3D | 0x3F => {
+                        let ch = self.regs.gpr[4] as u8;
+                        if ch.is_ascii() && ch != 0 {
+                            eprint!("{}", ch as char);
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("BIOS B0({:02X}) a0={:08X} a1={:08X} a2={:08X} ra={:08X}",
+                            call, self.regs.gpr[4], self.regs.gpr[5],
+                            self.regs.gpr[6], self.regs.gpr[31]);
+                    }
+                }
+            }
+            0xC0 => {
+                tracing::debug!("BIOS C0({:02X}) ra={:08X}", call, self.regs.gpr[31]);
+            }
             _ => {}
+        }
+    }
+
+    /// Software interrupt test — matching Redux psxTestSWInts().
+    /// Called after MTC0 to Status/Cause and after RFE.
+    /// Checks if SW interrupt bits in Cause match enabled bits in Status.
+    pub fn test_sw_ints(&mut self, _bus: &mut Bus) {
+        if self.regs.cp0[registers::CP0_CAUSE] & self.regs.cp0[registers::CP0_STATUS] & 0x0300 != 0
+            && self.regs.cp0[registers::CP0_STATUS] & 0x1 != 0
+        {
+            let in_delay = self.in_delay_slot;
+            self.in_delay_slot = false;
+            exceptions::exception_raw(self, self.regs.cp0[registers::CP0_CAUSE]);
         }
     }
 
@@ -176,17 +200,16 @@ impl Cpu {
             bus.handle_fired_interrupts(fired);
         }
 
-        // Check if any interrupt is pending and enabled
+        // Check if any hardware interrupt is pending and enabled
+        // Matching Redux branchTest() lines 401-417
         let istat = bus.read_istat();
         let imask = bus.read_imask();
-        if istat & imask != 0 {
-            let status = self.regs.cp0[registers::CP0_STATUS];
-            // IEc (bit 0) = interrupt enable current
-            if status & 0x0401 == 0x0401 {
-                // COP0 enabled and interrupts enabled
-                self.regs.cp0[registers::CP0_CAUSE] |= 0x0400; // IP2 = hardware interrupt
-                exceptions::exception(self, bus, exceptions::Exception::Interrupt);
-            }
+        if (istat & imask) != 0
+            && (self.regs.cp0[registers::CP0_STATUS] & 0x401) == 0x401
+        {
+            // Fire interrupt exception with Cause = 0x400 (IP2 + ExcCode=0)
+            // Matching Redux: exception(0x400, 0)
+            exceptions::exception_raw(self, 0x400);
         }
     }
 }

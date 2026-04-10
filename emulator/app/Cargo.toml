@@ -19,3 +19,6 @@ egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
 pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"

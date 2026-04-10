@@ -1,5 +1,8 @@
+mod config;
+
 use anyhow::Result;
 use clap::Parser;
+use config::Config;
 use core::bus::Bus;
 use core::cpu::Cpu;
 use std::path::PathBuf;
@@ -13,11 +16,11 @@ use winit::window::{Window, WindowId};
 #[derive(Parser)]
 #[command(name = "psoxide", about = "PSoXide-2 — PS1 Emulator")]
 struct Args {
-    /// Path to PS1 BIOS file (512KB)
+    /// Path to PS1 BIOS file (512KB). Overrides config.
     #[arg(short, long)]
-    bios: PathBuf,
+    bios: Option<PathBuf>,
 
-    /// Path to game disc image (.cue file)
+    /// Path to game disc image (.cue file). Overrides config.
     #[arg(short, long)]
     game: Option<PathBuf>,
 }
@@ -292,9 +295,19 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let cfg = Config::load().unwrap_or_default();
+
+    // CLI args override config file
+    let bios = args.bios.or(cfg.bios)
+        .ok_or_else(|| anyhow::anyhow!(
+            "No BIOS path. Pass --bios or set it in {:?}",
+            dirs::config_dir().unwrap_or_default().join("psoxide-2/config.toml")
+        ))?;
+    let _game = args.game.or(cfg.game);
+
     tracing::info!("PSoXide-2 starting");
 
-    let mut app = App::new(&args.bios)?;
+    let mut app = App::new(&bios)?;
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
 

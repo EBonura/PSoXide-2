@@ -276,15 +276,13 @@ impl CommandProcessor {
             0x20 | 0x22 => rast.flat_triangle(vram, buf[0], buf[1], buf[2], buf[3], &da, off),
             // Flat quad
             0x28 | 0x2A => rast.flat_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], &da, off),
-            // Textured tri
-            0x24 | 0x26 => {
-                // For now, draw flat with the command color (texture lookup TODO for accuracy)
-                rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off);
+            // Textured tri (opaque + semi-transparent)
+            0x24 | 0x25 | 0x26 | 0x27 => {
+                rast.textured_triangle(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], self.texpage, &da, off);
             }
-            // Textured quad
-            0x2C | 0x2E => {
-                rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off);
-                rast.flat_triangle(vram, buf[0], buf[3], buf[5], buf[7], &da, off);
+            // Textured quad (opaque + semi-transparent)
+            0x2C | 0x2D | 0x2E | 0x2F => {
+                rast.textured_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], self.texpage, &da, off);
             }
             // Gouraud tri
             0x30 | 0x32 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], &da, off),
@@ -294,14 +292,9 @@ impl CommandProcessor {
             0x34 | 0x36 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], &da, off),
             // Gouraud-textured quad
             0x3C | 0x3E => rast.gouraud_quad(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], buf[9], buf[10], &da, off),
-            // Semi-transparent variants (same geometry, blend mode differs)
+            // Semi-transparent flat variants
             0x21 | 0x23 => rast.flat_triangle(vram, buf[0], buf[1], buf[2], buf[3], &da, off),
             0x29 | 0x2B => rast.flat_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], &da, off),
-            0x25 | 0x27 => rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off),
-            0x2D | 0x2F => {
-                rast.flat_triangle(vram, buf[0], buf[1], buf[3], buf[5], &da, off);
-                rast.flat_triangle(vram, buf[0], buf[3], buf[5], buf[7], &da, off);
-            }
             0x31 | 0x33 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], &da, off),
             0x39 | 0x3B => rast.gouraud_quad(vram, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], &da, off),
             0x35 | 0x37 => rast.gouraud_triangle(vram, buf[0], buf[1], buf[3], buf[4], buf[6], buf[7], &da, off),
@@ -438,8 +431,8 @@ impl CommandProcessor {
                 display.is_24bit = data & 0x10 != 0;
                 display.interlaced = data & 0x20 != 0;
 
-                // Update status bits
-                status.raw = (status.raw & !0x7F4000) | ((data & 0x3F) << 17) | ((data & 0x40) << 10);
+                // Update status bits 22:16 only — must not touch bit 14 (texpage Y-base)
+                status.raw = (status.raw & !0x7F0000) | ((data & 0x3F) << 17) | ((data & 0x40) << 10);
             }
             0x10 => {
                 // Get GPU info — matching Redux writeStatus case 16 + write1(CtrlQuery)
@@ -457,6 +450,13 @@ impl CommandProcessor {
                 tracing::trace!("GP1 unhandled command: {:02X} data={:08X}", cmd, data);
             }
         }
+    }
+
+    /// Returns true if a VRAM→CPU transfer is pending (data available via read_data).
+    /// Matches pcsx-redux's `m_readFifo->size() != 0` check that drives
+    /// GPUSTATUS_READYFORVRAM (bit 27).
+    pub fn has_vram_read_pending(&self) -> bool {
+        matches!(self.state, GpuState::VramToCpu { .. })
     }
 
     pub fn read_data(&mut self, vram: &mut Vram) -> u32 {

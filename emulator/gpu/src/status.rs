@@ -37,4 +37,12 @@ impl GpuStatus {
     pub fn set_interlace_field(&mut self, odd: bool) {
         self.set_bit(31, odd);
     }
+
+    /// Toggle GPUSTAT bit 31 (interlace/field flag).
+    /// Matching pcsx-redux SoftGPU::vblank(): `m_statusRet ^= 0x80000000`.
+    /// Called once per VBlank. The retail BIOS shell's waitVSync polls this
+    /// bit and waits for it to toggle between frames.
+    pub fn toggle_interlace_field(&mut self) {
+        self.raw ^= 0x8000_0000;
+    }
 }

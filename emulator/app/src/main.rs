@@ -28,10 +28,25 @@ const DISPLAY_WIDTH: u32 = 1280;
 const DISPLAY_HEIGHT: u32 = 720;
 const CYCLES_PER_FRAME: u64 = 33_868_800 / 60;
 const EXEC_HISTORY_SIZE: usize = 64;
+const VRAM_WIDTH: u32 = 1024;
+const VRAM_HEIGHT: u32 = 512;
 
 struct ExecEntry {
     pc: u32,
     code: u32,
+}
+
+/// Top-level UI layout mode.
+///
+/// `Debug` is the bring-up layout: left inspection pane with registers and
+/// debug info, right visualization column with game on top and VRAM below.
+/// `Standard` is the end-user layout: just the game, centered and scaled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[allow(dead_code)] // `Standard` has no UI toggle yet; kept so adding one is a single-line change.
+enum ViewMode {
+    #[default]
+    Debug,
+    Standard,
 }
 
 struct App {
@@ -44,6 +59,7 @@ struct App {
     exec_history: VecDeque<ExecEntry>,
     paused: bool,
     step_one: bool,
+    view_mode: ViewMode,
 }
 
 struct WgpuState {
@@ -52,20 +68,22 @@ struct WgpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     vram_texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-    pipeline: wgpu::RenderPipeline,
 }
 
 struct EguiState {
     ctx: egui::Context,
     winit_state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
+    vram_texture_id: egui::TextureId,
 }
 
 impl App {
-    fn new(bios_path: &PathBuf) -> Result<Self> {
+    fn new(bios_path: &PathBuf, game_path: Option<&PathBuf>) -> Result<Self> {
         let mut bus = Bus::new();
         bus.load_bios(bios_path)?;
+        if let Some(game) = game_path {
+            bus.load_disc(game)?;
+        }
         let mut cpu = Cpu::new();
         cpu.reset();
         Ok(Self {
@@ -78,6 +96,7 @@ impl App {
             exec_history: VecDeque::with_capacity(EXEC_HISTORY_SIZE),
             paused: false,
             step_one: false,
+            view_mode: ViewMode::default(),
         })
     }
 
@@ -104,24 +123,92 @@ impl App {
         // One-shot diagnostic at frame 60
         if self.frame_count == 60 {
             let nz = self.bus.gpu.nonzero_pixel_count(0, 0, 1024, 512);
-            eprintln!("FRAME60: GP0={} GP1={} GPUSTAT={:08X} VRAM_nz={} PC={:08X} Status={:08X}",
+            let imask = self.bus.read_imask();
+            let istat = self.bus.read_istat();
+            eprintln!("FRAME60: GP0={} GP1={} GPUSTAT={:08X} VRAM_nz={} PC={:08X} Status={:08X} IMASK={:04X} ISTAT={:04X}",
                 self.bus.gpu.gp0_count(), self.bus.gpu.gp1_count(),
                 self.bus.gpu.read_status(), nz,
-                self.cpu.regs.pc, self.cpu.regs.cp0[12]);
+                self.cpu.regs.pc, self.cpu.regs.cp0[12], imask, istat);
         }
     }
 
-    fn draw_debug_ui(&mut self) {
-        let Some(egui_state) = &self.egui_state else { return };
-        let ctx = &egui_state.ctx;
+    fn draw_ui(&mut self) {
+        let (ctx, tex) = {
+            let Some(egui_state) = self.egui_state.as_ref() else { return };
+            (egui_state.ctx.clone(), egui_state.vram_texture_id)
+        };
 
-        egui::SidePanel::left("debug_panel").default_width(340.0).show(ctx, |ui| {
-            // Registers
-            ui.heading("Registers");
-            egui::Grid::new("regs").num_columns(4).spacing([8.0, 2.0]).show(ui, |ui| {
+        match self.view_mode {
+            ViewMode::Debug => self.draw_debug_layout(&ctx, tex),
+            ViewMode::Standard => self.draw_standard_layout(&ctx, tex),
+        }
+    }
+
+    fn draw_debug_layout(&mut self, ctx: &egui::Context, tex: egui::TextureId) {
+        egui::SidePanel::left("debug_panel")
+            .resizable(true)
+            .default_width(340.0)
+            .min_width(260.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        self.debug_pane_contents(ui);
+                    });
+            });
+
+        let screen_h = ctx.screen_rect().height();
+        egui::TopBottomPanel::bottom("vram_panel")
+            .resizable(true)
+            .default_height((screen_h * 0.32).max(160.0))
+            .min_height(120.0)
+            .show(ctx, |ui| {
+                ui.label("VRAM (1024×512)");
+                paint_image_fit(
+                    ui,
+                    tex,
+                    egui::vec2(VRAM_WIDTH as f32, VRAM_HEIGHT as f32),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                );
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                self.paint_game_view(ui, tex);
+            });
+    }
+
+    fn draw_standard_layout(&mut self, ctx: &egui::Context, tex: egui::TextureId) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                self.paint_game_view(ui, tex);
+            });
+    }
+
+    fn paint_game_view(&self, ui: &mut egui::Ui, tex: egui::TextureId) {
+        let disp = &self.bus.gpu.display;
+        let dw = disp.width().max(1) as f32;
+        let dh = disp.height().max(1) as f32;
+        let dx = disp.display_area_x as f32;
+        let dy = disp.display_area_y as f32;
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(dx / VRAM_WIDTH as f32, dy / VRAM_HEIGHT as f32),
+            egui::pos2((dx + dw) / VRAM_WIDTH as f32, (dy + dh) / VRAM_HEIGHT as f32),
+        );
+        paint_image_fit(ui, tex, egui::vec2(dw, dh), uv);
+    }
+
+    fn debug_pane_contents(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Registers");
+        egui::Grid::new("regs")
+            .num_columns(4)
+            .spacing([8.0, 2.0])
+            .show(ui, |ui| {
                 for i in (0..32).step_by(2) {
                     ui.monospace(format!("{:4}={:08X}", GPR_NAMES[i], self.cpu.regs.gpr[i]));
-                    ui.monospace(format!("{:4}={:08X}", GPR_NAMES[i+1], self.cpu.regs.gpr[i+1]));
+                    ui.monospace(format!("{:4}={:08X}", GPR_NAMES[i + 1], self.cpu.regs.gpr[i + 1]));
                     ui.end_row();
                 }
                 ui.monospace(format!("  PC={:08X}", self.cpu.regs.pc));
@@ -132,9 +219,12 @@ impl App {
                 ui.end_row();
             });
 
-            ui.separator();
-            ui.heading("COP0");
-            egui::Grid::new("cop0").num_columns(2).spacing([8.0, 2.0]).show(ui, |ui| {
+        ui.separator();
+        ui.heading("COP0");
+        egui::Grid::new("cop0")
+            .num_columns(2)
+            .spacing([8.0, 2.0])
+            .show(ui, |ui| {
                 ui.monospace(format!("Status={:08X}", self.cpu.regs.cp0[12]));
                 ui.monospace(format!(" Cause={:08X}", self.cpu.regs.cp0[13]));
                 ui.end_row();
@@ -143,102 +233,128 @@ impl App {
                 ui.end_row();
             });
 
-            ui.separator();
-            ui.heading("IRQ");
-            ui.monospace(format!("ISTAT={:08X}  IMASK={:08X}", self.bus.read_istat(), self.bus.read_imask()));
+        ui.separator();
+        ui.heading("IRQ");
+        ui.monospace(format!(
+            "ISTAT={:08X}  IMASK={:08X}",
+            self.bus.read_istat(),
+            self.bus.read_imask()
+        ));
 
-            ui.separator();
-            ui.heading("GPU");
-            ui.monospace(format!("GPUSTAT={:08X}", self.bus.gpu.read_status()));
-            ui.monospace(format!("Display: {}x{} at ({},{})",
-                self.bus.gpu.display.width(), self.bus.gpu.display.height(),
-                self.bus.gpu.display.display_area_x, self.bus.gpu.display.display_area_y));
-            let da = &self.bus.gpu.command_processor;
-            ui.monospace(format!("DrawArea: ({},{})..({},{})", da.draw_area_left, da.draw_area_top, da.draw_area_right, da.draw_area_bottom));
-            ui.monospace(format!("DrawOff: ({},{})", da.draw_offset_x, da.draw_offset_y));
-            ui.monospace(format!("GP0={} GP1={}", self.bus.gpu.gp0_count(), self.bus.gpu.gp1_count()));
-            let nz = self.bus.gpu.nonzero_pixel_count(
-                self.bus.gpu.display.display_area_x,
-                self.bus.gpu.display.display_area_y,
-                self.bus.gpu.display.width().min(320),
-                self.bus.gpu.display.height().min(240),
-            );
-            ui.monospace(format!("VRAM nonzero: {}", nz));
+        ui.separator();
+        ui.heading("GPU");
+        ui.monospace(format!("GPUSTAT={:08X}", self.bus.gpu.read_status()));
+        ui.monospace(format!(
+            "Display: {}x{} at ({},{})",
+            self.bus.gpu.display.width(),
+            self.bus.gpu.display.height(),
+            self.bus.gpu.display.display_area_x,
+            self.bus.gpu.display.display_area_y
+        ));
+        let da = &self.bus.gpu.command_processor;
+        ui.monospace(format!(
+            "DrawArea: ({},{})..({},{})",
+            da.draw_area_left, da.draw_area_top, da.draw_area_right, da.draw_area_bottom
+        ));
+        ui.monospace(format!("DrawOff: ({},{})", da.draw_offset_x, da.draw_offset_y));
+        ui.monospace(format!(
+            "GP0={} GP1={}",
+            self.bus.gpu.gp0_count(),
+            self.bus.gpu.gp1_count()
+        ));
+        let nz = self.bus.gpu.nonzero_pixel_count(
+            self.bus.gpu.display.display_area_x,
+            self.bus.gpu.display.display_area_y,
+            self.bus.gpu.display.width().min(320),
+            self.bus.gpu.display.height().min(240),
+        );
+        ui.monospace(format!("VRAM nonzero: {}", nz));
 
-            ui.separator();
-            // Controls
-            ui.horizontal(|ui| {
-                if ui.button(if self.paused { "Play" } else { "Pause" }).clicked() {
-                    self.paused = !self.paused;
-                }
-                if ui.button("Step").clicked() {
-                    self.paused = true;
-                    self.step_one = true;
-                }
-            });
-            ui.label(format!("Frame: {}", self.frame_count));
-
-            ui.separator();
-            ui.heading("Execution History");
-            egui::ScrollArea::vertical().max_height(300.0).stick_to_bottom(true).show(ui, |ui| {
-                for entry in &self.exec_history {
-                    ui.monospace(format!("{:08X}: {:08X}", entry.pc, entry.code));
-                }
-            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button(if self.paused { "Play" } else { "Pause" }).clicked() {
+                self.paused = !self.paused;
+            }
+            if ui.button("Step").clicked() {
+                self.paused = true;
+                self.step_one = true;
+            }
         });
+        ui.label(format!("Frame: {}", self.frame_count));
+
+        ui.separator();
+        ui.heading("Execution History");
+        for entry in &self.exec_history {
+            ui.monospace(format!("{:08X}: {:08X}", entry.pc, entry.code));
+        }
     }
 
     fn render(&mut self) {
-        if self.wgpu_state.is_none() || self.egui_state.is_none() { return; }
+        if self.wgpu_state.is_none() || self.egui_state.is_none() {
+            return;
+        }
         let window = self.window.as_ref().unwrap().clone();
 
-        // Begin egui frame (needs &mut self for draw_debug_ui)
-        let raw_input = self.egui_state.as_mut().unwrap().winit_state.take_egui_input(&window);
+        // Begin egui frame (needs &mut self for draw_ui)
+        let raw_input = self
+            .egui_state
+            .as_mut()
+            .unwrap()
+            .winit_state
+            .take_egui_input(&window);
         self.egui_state.as_mut().unwrap().ctx.begin_pass(raw_input);
-        self.draw_debug_ui();
+        self.draw_ui();
         let full_output = self.egui_state.as_mut().unwrap().ctx.end_pass();
-        self.egui_state.as_mut().unwrap().winit_state.handle_platform_output(&window, full_output.platform_output);
+        self.egui_state
+            .as_mut()
+            .unwrap()
+            .winit_state
+            .handle_platform_output(&window, full_output.platform_output);
         let ppp = self.egui_state.as_ref().unwrap().ctx.pixels_per_point();
-        let paint_jobs = self.egui_state.as_ref().unwrap().ctx.tessellate(full_output.shapes, ppp);
+        let paint_jobs = self
+            .egui_state
+            .as_ref()
+            .unwrap()
+            .ctx
+            .tessellate(full_output.shapes, ppp);
 
-        // Now borrow wgpu_state immutably
         let state = self.wgpu_state.as_ref().unwrap();
 
-        // Upload full VRAM (1024x512) — shows everything including textures/framebuffers
+        // Upload full VRAM (1024x512). egui reads this texture via the TextureId
+        // registered in resumed(), so both the game view (UV-cropped to the
+        // display area) and the VRAM pane see the latest contents.
         let rgba = self.bus.gpu.vram.to_rgba8(0, 0, 1024, 512);
         state.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &state.vram_texture, mip_level: 0,
-                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+                texture: &state.vram_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
             },
             &rgba,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024 * 4), rows_per_image: Some(512) },
-            wgpu::Extent3d { width: 1024, height: 512, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(1024 * 4),
+                rows_per_image: Some(512),
+            },
+            wgpu::Extent3d {
+                width: 1024,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
         );
 
         let output = match state.surface.get_current_texture() {
             Ok(t) => t,
             Err(_) => return,
         };
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // VRAM quad pass
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view, resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None, ..Default::default()
-            });
-            pass.set_pipeline(&state.pipeline);
-            pass.set_bind_group(0, &state.bind_group, &[]);
-            pass.draw(0..6, 0..1);
-        }
-
-        // egui pass — single borrow of egui_state to satisfy wgpu 24 lifetimes
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [state.config.width, state.config.height],
             pixels_per_point: window.scale_factor() as f32,
@@ -246,19 +362,36 @@ impl App {
         {
             let egui_state = self.egui_state.as_mut().unwrap();
             for (id, delta) in &full_output.textures_delta.set {
-                egui_state.renderer.update_texture(&state.device, &state.queue, *id, delta);
+                egui_state
+                    .renderer
+                    .update_texture(&state.device, &state.queue, *id, delta);
             }
-            egui_state.renderer.update_buffers(&state.device, &state.queue, &mut encoder, &paint_jobs, &screen_descriptor);
+            egui_state.renderer.update_buffers(
+                &state.device,
+                &state.queue,
+                &mut encoder,
+                &paint_jobs,
+                &screen_descriptor,
+            );
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("egui"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view, resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None, ..Default::default()
-                }).forget_lifetime();
-                egui_state.renderer.render(&mut pass, &paint_jobs, &screen_descriptor);
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                egui_state
+                    .renderer
+                    .render(&mut pass, &paint_jobs, &screen_descriptor);
             }
             for id in &full_output.textures_delta.free {
                 egui_state.renderer.free_texture(id);
@@ -270,9 +403,30 @@ impl App {
     }
 }
 
+/// Fit `tex_size` into the remaining space of `ui`, preserving aspect ratio,
+/// and paint the given texture (with `uv`) centered in that space.
+fn paint_image_fit(
+    ui: &mut egui::Ui,
+    tex: egui::TextureId,
+    tex_size: egui::Vec2,
+    uv: egui::Rect,
+) {
+    let avail = ui.available_rect_before_wrap();
+    if avail.width() <= 0.0 || avail.height() <= 0.0 || tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+        return;
+    }
+    let scale = (avail.width() / tex_size.x).min(avail.height() / tex_size.y);
+    let size = tex_size * scale;
+    let rect = egui::Rect::from_center_size(avail.center(), size);
+    ui.allocate_rect(avail, egui::Sense::hover());
+    egui::Image::new((tex, size)).uv(uv).paint_at(ui, rect);
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() { return; }
+        if self.window.is_some() {
+            return;
+        }
 
         let attrs = Window::default_attributes()
             .with_title("PSoXide-2")
@@ -285,80 +439,55 @@ impl ApplicationHandler for App {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface),
             ..Default::default()
-        })).unwrap();
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor::default(), None,
-        )).unwrap();
+        }))
+        .unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .unwrap();
 
         let size = window.inner_size();
-        let config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).unwrap();
+        let config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .unwrap();
         surface.configure(&device, &config);
 
         let vram_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("VRAM"),
-            size: wgpu::Extent3d { width: 1024, height: 512, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1,
+            size: wgpu::Extent3d {
+                width: VRAM_WIDTH,
+                height: VRAM_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let vram_view = vram_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(include_str!("fullscreen.wgsl").into()),
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None, layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&vram_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&bind_group_layout], push_constant_ranges: &[],
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None, layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None, multisample: wgpu::MultisampleState::default(),
-            multiview: None, cache: None,
-        });
 
         // egui
         let ctx = egui::Context::default();
-        let winit_state = egui_winit::State::new(ctx.clone(), ctx.viewport_id(), &window, None, None, None);
-        let renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let winit_state =
+            egui_winit::State::new(ctx.clone(), ctx.viewport_id(), &window, None, None, None);
+        let mut renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let vram_texture_id =
+            renderer.register_native_texture(&device, &vram_view, wgpu::FilterMode::Nearest);
 
-        self.wgpu_state = Some(WgpuState { surface, device, queue, config, vram_texture, bind_group, pipeline });
-        self.egui_state = Some(EguiState { ctx, winit_state, renderer });
+        self.wgpu_state = Some(WgpuState {
+            surface,
+            device,
+            queue,
+            config,
+            vram_texture,
+        });
+        self.egui_state = Some(EguiState {
+            ctx,
+            winit_state,
+            renderer,
+            vram_texture_id,
+        });
         event_loop.set_control_flow(ControlFlow::Poll);
         window.request_redraw();
     }
@@ -372,7 +501,9 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Let egui handle events first
         if let Some(egui_state) = &mut self.egui_state {
-            let _ = egui_state.winit_state.on_window_event(self.window.as_ref().unwrap(), &event);
+            let _ = egui_state
+                .winit_state
+                .on_window_event(self.window.as_ref().unwrap(), &event);
         }
 
         match event {
@@ -403,11 +534,13 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let cfg = Config::load().unwrap_or_default();
-    let bios = args.bios.or(cfg.bios)
+    let bios = args
+        .bios
+        .or(cfg.bios)
         .ok_or_else(|| anyhow::anyhow!("No BIOS path. Pass --bios or set it in config.toml"))?;
-    let _game = args.game.or(cfg.game);
+    let game = args.game.or(cfg.game);
 
-    let mut app = App::new(&bios)?;
+    let mut app = App::new(&bios, game.as_ref())?;
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
     Ok(())

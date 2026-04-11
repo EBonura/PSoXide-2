@@ -47,7 +47,15 @@ impl Gpu {
     }
 
     pub fn read_status(&self) -> u32 {
-        self.status.read()
+        let mut ret = self.status.read();
+        // Matching pcsx-redux GPU::readStatus():
+        //   if (m_readFifo->size() != 0) ret |= GPUSTATUS_READYFORVRAM;
+        // Bit 27 (0x08000000) indicates data is available for CPU readback.
+        // Asserted while a GP0(0xC0) VRAM→CPU transfer has pixels remaining.
+        if self.command_processor.has_vram_read_pending() {
+            ret |= 0x0800_0000;
+        }
+        ret
     }
 
     pub fn gp0_count(&self) -> u32 { self.command_processor.gp0_count }

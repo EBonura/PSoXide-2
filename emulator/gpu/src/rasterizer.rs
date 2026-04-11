@@ -67,7 +67,7 @@ impl Rasterizer {
         let p1 = unpack_vertex(v1, offset.0, offset.1);
         let p2 = unpack_vertex(v2, offset.0, offset.1);
 
-        self.rasterize_triangle(vram, draw_area, p0, p1, p2, |_, _, _| pixel);
+        self.rasterize_triangle(vram, draw_area, p0, p1, p2, |_, _, _, _| pixel);
     }
 
     /// Flat-shaded opaque quad (two triangles)
@@ -93,7 +93,7 @@ impl Rasterizer {
         let p1 = unpack_vertex(v1, offset.0, offset.1);
         let p2 = unpack_vertex(v2, offset.0, offset.1);
 
-        self.rasterize_triangle(vram, draw_area, p0, p1, p2, |w0, w1, w2| {
+        self.rasterize_triangle(vram, draw_area, p0, p1, p2, |_, w0, w1, w2| {
             let r = ((r0 as i32 * w0 + r1 as i32 * w1 + r2 as i32 * w2) >> 12).clamp(0, 255) as u8;
             let g = ((g0 as i32 * w0 + g1 as i32 * w1 + g2 as i32 * w2) >> 12).clamp(0, 255) as u8;
             let b = ((b0 as i32 * w0 + b1 as i32 * w1 + b2 as i32 * w2) >> 12).clamp(0, 255) as u8;
@@ -173,11 +173,73 @@ impl Rasterizer {
         }
     }
 
-    /// Barycentric triangle rasterizer
+    /// Textured triangle — barycentric UV interpolation + CLUT/texpage sampling
+    pub fn textured_triangle(
+        &self, vram: &mut Vram,
+        color: u32, v0: u32, uv_clut0: u32,
+        v1: u32, uv_tp1: u32,
+        v2: u32, uv2: u32,
+        texpage: u32, draw_area: &DrawArea, offset: (i16, i16),
+    ) {
+        let p0 = unpack_vertex(v0, offset.0, offset.1);
+        let p1 = unpack_vertex(v1, offset.0, offset.1);
+        let p2 = unpack_vertex(v2, offset.0, offset.1);
+
+        let u0 = (uv_clut0 & 0xFF) as i32;
+        let v0_t = ((uv_clut0 >> 8) & 0xFF) as i32;
+        let clut_x = (((uv_clut0 >> 16) & 0x3F) * 16) as u16;
+        let clut_y = ((uv_clut0 >> 22) & 0x1FF) as u16;
+
+        let u1 = (uv_tp1 & 0xFF) as i32;
+        let v1_t = ((uv_tp1 >> 8) & 0xFF) as i32;
+        // TPage from second vertex UV word, or fall back to current texpage register
+        let tp = if uv_tp1 & 0xFFFF0000 != 0 { uv_tp1 >> 16 } else { texpage & 0xFFFF };
+        let tp_x = ((tp & 0xF) * 64) as u16;
+        let tp_y = (((tp >> 4) & 1) * 256) as u16;
+        let depth = (tp >> 7) & 3;
+
+        let u2 = (uv2 & 0xFF) as i32;
+        let v2_t = ((uv2 >> 8) & 0xFF) as i32;
+
+        let (cr, cg, cb) = unpack_color(color);
+
+        self.rasterize_triangle(vram, draw_area, p0, p1, p2, |vr, w0, w1, w2| {
+            let u = ((u0 * w0 + u1 * w1 + u2 * w2) >> 12).clamp(0, 255) as u16;
+            let v = ((v0_t * w0 + v1_t * w1 + v2_t * w2) >> 12).clamp(0, 255) as u16;
+            let texel = sample_texture(vr, tp_x, tp_y, clut_x, clut_y, u, v, depth);
+            if texel == 0 { return 0; }
+            // Modulate by vertex color (0x80 = neutral)
+            if cr == 0x80 && cg == 0x80 && cb == 0x80 {
+                texel
+            } else {
+                let tr = ((texel & 0x1F) as u32 * cr as u32) >> 7;
+                let tg = (((texel >> 5) & 0x1F) as u32 * cg as u32) >> 7;
+                let tb = (((texel >> 10) & 0x1F) as u32 * cb as u32) >> 7;
+                (tr.min(0x1F) as u16) | ((tg.min(0x1F) as u16) << 5) | ((tb.min(0x1F) as u16) << 10)
+            }
+        });
+    }
+
+    /// Textured quad (two textured triangles)
+    pub fn textured_quad(
+        &self, vram: &mut Vram,
+        color: u32, v0: u32, uv_clut0: u32,
+        v1: u32, uv_tp1: u32,
+        v2: u32, uv2: u32,
+        v3: u32, uv3: u32,
+        texpage: u32, draw_area: &DrawArea, offset: (i16, i16),
+    ) {
+        self.textured_triangle(vram, color, v0, uv_clut0, v1, uv_tp1, v2, uv2, texpage, draw_area, offset);
+        self.textured_triangle(vram, color, v1, uv_tp1, v2, uv2, v3, uv3, texpage, draw_area, offset);
+    }
+
+    /// Barycentric triangle rasterizer.
+    /// Shade closure receives (&Vram, w0, w1, w2) so textured paths can sample.
+    /// Returns 0 for transparent (skipped).
     fn rasterize_triangle(
         &self, vram: &mut Vram, draw_area: &DrawArea,
         p0: (i32, i32), p1: (i32, i32), p2: (i32, i32),
-        shade: impl Fn(i32, i32, i32) -> u16,
+        shade: impl Fn(&Vram, i32, i32, i32) -> u16,
     ) {
         // Bounding box
         let min_x = p0.0.min(p1.0).min(p2.0).max(draw_area.left);
@@ -211,7 +273,8 @@ impl Rasterizer {
                     let bw1 = (w1 * 4096) / area;
                     let bw2 = 4096 - bw0 - bw1;
 
-                    let pixel = shade(bw0, bw1, bw2);
+                    let pixel = shade(vram, bw0, bw1, bw2);
+                    if pixel == 0 { continue; } // transparent texel
                     for sy in 0..s {
                         for sx in 0..s {
                             vram.set_pixel_scaled(x * s + sx, y * s + sy, pixel, self.scale);

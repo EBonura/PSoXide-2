@@ -85,11 +85,21 @@ pub fn dma_gpu(bus: &mut Bus, madr: u32, bcr: u32, chcr: u32) {
 }
 
 /// DMA Channel 3: CD-ROM -> RAM
+/// Matching Redux cdr::dma(): guards on m_read (not DRQSTS).
 pub fn dma_cdrom(bus: &mut Bus, madr: u32, bcr: u32, chcr: u32) {
     match chcr {
         0x11000000 | 0x11400100 => {
-            if !bus.cdrom_has_data() {
-                tracing::debug!("DMA3 CD-ROM: not ready");
+            // DIAG: track first few DMA3 transfers
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    eprintln!("DMA3_CALL #{}: madr={:08X} bcr={:08X} chcr={:08X} m_read={}",
+                        n, madr, bcr, chcr, bus.cdrom.is_read_active());
+                }
+            }
+            if !bus.cdrom.is_read_active() {
                 bus.dma_channel_done(3);
                 return;
             }
@@ -99,6 +109,17 @@ pub fn dma_cdrom(bus: &mut Bus, madr: u32, bcr: u32, chcr: u32) {
             let mut buf = vec![0u8; cdsize];
             bus.cdrom.dma_read(&mut buf);
 
+            // DIAG: log what was transferred
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static M: AtomicU32 = AtomicU32::new(0);
+                let m = M.fetch_add(1, Ordering::Relaxed);
+                if m < 4 {
+                    eprintln!("DMA3_XFER #{}: {} bytes to {:08X}, first16={:02X?}",
+                        m, cdsize, madr, &buf[..16.min(buf.len())]);
+                }
+            }
+
             let mut addr = madr & 0x1F_FFFC;
             for chunk in buf.chunks(4) {
                 let phys = (addr & 0x1F_FFFF) as usize;
@@ -106,7 +127,6 @@ pub fn dma_cdrom(bus: &mut Bus, madr: u32, bcr: u32, chcr: u32) {
                 bus.ram[phys..phys+len].copy_from_slice(&chunk[..len]);
                 addr = addr.wrapping_add(4) & 0x1F_FFFC;
             }
-            tracing::debug!("DMA3 CD-ROM: {} bytes to {:08X}", cdsize, madr);
         }
         _ => tracing::warn!("DMA3 unknown chcr: {:08X}", chcr),
     }
@@ -114,28 +134,59 @@ pub fn dma_cdrom(bus: &mut Bus, madr: u32, bcr: u32, chcr: u32) {
 }
 
 /// DMA Channel 4: SPU
+/// Matches pcsx-redux psxdma.cc dma4() + dmaExec<4> post-transfer updates.
+///   CHCR 0x01000201 = RAM → SPU (writeDMAMem)
+///   CHCR 0x01000200 = SPU → RAM (readDMAMem)
+///   size = (bcr>>16) * (bcr&0xffff) * 2  (in 16-bit words)
 pub fn dma_spu(bus: &mut Bus, madr: u32, bcr: u32, chcr: u32) {
-    let direction = chcr & 1;
-    let block_size = if bcr & 0xFFFF == 0 { 0x10000u32 } else { bcr & 0xFFFF };
-    let block_count = if bcr >> 16 == 0 { 0x10000u32 } else { bcr >> 16 };
-    let total_words = block_count * block_size;
-    let total_bytes = (total_words * 4) as usize;
+    let size = ((bcr >> 16) * (bcr & 0xFFFF) * 2) as usize; // 16-bit word count
 
-    if direction == 0 {
-        // SPU -> RAM (read from SPU RAM)
-        tracing::debug!("DMA4 SPU->RAM: {} bytes from SPU to {:08X}", total_bytes, madr);
-        // Stub: fill with zeros
-        let mut addr = madr;
-        for _ in 0..total_words {
-            let phys = (addr & 0x1F_FFFF) as usize;
-            bus.ram[phys..phys+4].fill(0);
-            addr = addr.wrapping_add(4) & 0x1F_FFFC;
+    match chcr {
+        0x01000201 => {
+            // RAM → SPU
+            let mut data = vec![0u16; size];
+            let mut addr = madr;
+            for word in data.iter_mut() {
+                let phys = (addr & 0x1F_FFFF) as usize;
+                *word = u16::from_le_bytes([bus.ram[phys], bus.ram[phys + 1]]);
+                addr = addr.wrapping_add(2);
+            }
+            bus.spu.dma_write(&data);
+            tracing::debug!("DMA4 RAM→SPU: {} halfwords from {:08X}", size, madr);
         }
-    } else {
-        // RAM -> SPU (write to SPU RAM)
-        tracing::debug!("DMA4 RAM->SPU: {} bytes from {:08X}", total_bytes, madr);
-        // Stub: ignore the data (SPU RAM not modeled for playback yet)
+        0x01000200 => {
+            // SPU → RAM
+            let mut data = vec![0u16; size];
+            bus.spu.dma_read(&mut data);
+            let mut addr = madr;
+            for &word in &data {
+                let phys = (addr & 0x1F_FFFF) as usize;
+                let bytes = word.to_le_bytes();
+                bus.ram[phys] = bytes[0];
+                bus.ram[phys + 1] = bytes[1];
+                addr = addr.wrapping_add(2);
+            }
+            tracing::debug!("DMA4 SPU→RAM: {} halfwords to {:08X}", size, madr);
+        }
+        _ => {
+            tracing::warn!("DMA4 SPU unknown CHCR: {:08X}", chcr);
+        }
     }
+
+    // Post-transfer register updates — matching Redux dmaExec<4> template.
+    // Mode 1 (block): advance MADR, clear block count in BCR.
+    let mode = (chcr >> 9) & 3;
+    let block_count = if bcr >> 16 == 0 { 0x10000u32 } else { bcr >> 16 };
+    let block_size = bcr & 0xFFFF;
+    let total_words = block_count * block_size;
+    let new_madr = madr.wrapping_add(total_words * 4);
+    bus.write_hw_reg32(0x10C0, new_madr & 0x00FF_FFFF); // DMA4 MADR
+    if mode == 0 {
+        bus.write_hw_reg32(0x10C4, bcr & 0xFFFF_0000); // keep count, clear size
+    } else if mode == 1 {
+        bus.write_hw_reg32(0x10C4, bcr & 0x0000_FFFF); // keep size, clear count
+    }
+
     bus.dma_channel_done(4);
 }
 

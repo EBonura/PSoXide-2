@@ -1,3 +1,17 @@
+#[inline]
+fn bcd_to_dec(bcd: u8) -> u8 { (bcd >> 4) * 10 + (bcd & 0x0F) }
+#[inline]
+fn inc_msf(msf: &mut [u8; 3]) {
+    let mut f = bcd_to_dec(msf[2]) + 1;
+    let mut s = bcd_to_dec(msf[1]);
+    let mut m = bcd_to_dec(msf[0]);
+    if f >= 75 { f = 0; s += 1; }
+    if s >= 60 { s = 0; m += 1; }
+    msf[0] = ((m / 10) << 4) | (m % 10);
+    msf[1] = ((s / 10) << 4) | (s % 10);
+    msf[2] = ((f / 10) << 4) | (f % 10);
+}
+
 /// CD-ROM controller — ported from PCSX-Redux cdrom.cc
 ///
 /// Implements the PS1 CD-ROM register interface (4 ports, indexed),
@@ -112,6 +126,8 @@ pub struct CdRom {
     channel: u8,
     has_disc: bool,
     pub pending_irqs: Vec<CdInterrupt>,
+    /// Raw disc image data (MODE2/2352 BIN format)
+    disc_data: Vec<u8>,
 }
 
 impl CdRom {
@@ -128,7 +144,66 @@ impl CdRom {
             setloc_pending: false, location_changed: false,
             file: 1, channel: 1, has_disc: false,
             pending_irqs: Vec::new(),
+            disc_data: Vec::new(),
         }
+    }
+
+    /// Load a disc image from a CUE/BIN file pair.
+    /// Parses the CUE to find the BIN filename, then loads the raw BIN data.
+    pub fn load_disc(&mut self, cue_path: &std::path::Path) -> Result<(), String> {
+        let cue_text = std::fs::read_to_string(cue_path)
+            .map_err(|e| format!("Failed to read CUE: {}", e))?;
+        // Parse BIN filename from CUE
+        let bin_name = cue_text.lines()
+            .find(|l| l.trim().starts_with("FILE"))
+            .and_then(|l| {
+                let l = l.trim();
+                if let Some(start) = l.find('"') {
+                    let rest = &l[start + 1..];
+                    rest.find('"').map(|end| &rest[..end])
+                } else {
+                    l.split_whitespace().nth(1)
+                }
+            })
+            .ok_or("No FILE directive in CUE")?;
+        let bin_path = cue_path.parent().unwrap_or(std::path::Path::new(".")).join(bin_name);
+        self.disc_data = std::fs::read(&bin_path)
+            .map_err(|e| format!("Failed to read BIN {}: {}", bin_path.display(), e))?;
+        self.has_disc = true;
+        eprintln!("CD-ROM: loaded {} ({} bytes, {} sectors)",
+            bin_path.display(), self.disc_data.len(), self.disc_data.len() / 2352);
+        Ok(())
+    }
+
+    /// Read a raw 2352-byte sector from the disc image at the given BCD MSF.
+    fn read_sector(&self, msf: &[u8; 3]) -> &[u8] {
+        let m = bcd_to_dec(msf[0]) as u32;
+        let s = bcd_to_dec(msf[1]) as u32;
+        let f = bcd_to_dec(msf[2]) as u32;
+        let lba = (m * 60 + s) * 75 + f;
+        let offset = lba as usize * 2352;
+        if offset + 2352 <= self.disc_data.len() {
+            &self.disc_data[offset..offset + 2352]
+        } else {
+            &[0u8; 0] // out of range
+        }
+    }
+
+    /// Read Mode 2 Form 1 user data (2048 bytes) from sector at given LBA.
+    /// Returns the 2048-byte user data region (offset 24 in the raw sector).
+    pub fn read_sector_data(&self, lba: u32) -> Option<&[u8]> {
+        let offset = lba as usize * 2352;
+        if offset + 2352 <= self.disc_data.len() {
+            // Mode 2 Form 1: user data starts at byte 24, 2048 bytes
+            Some(&self.disc_data[offset + 24..offset + 24 + 2048])
+        } else {
+            None
+        }
+    }
+
+    /// Check if a disc is loaded.
+    pub fn has_disc(&self) -> bool {
+        self.has_disc
     }
 
     fn set_result_size(&mut self, size: u8) {
@@ -145,7 +220,7 @@ impl CdRom {
 
     fn add_irq_queue(&mut self, irq: u16, ecycle: u32) {
         if self.irq != 0 {
-            if irq == self.irq || irq == self.irq.wrapping_add(0x100) {
+            if irq == self.irq || irq.wrapping_add(0x100) == self.irq {
                 self.irq_repeated = 1;
                 self.pending_irqs.push(CdInterrupt { irq_type: CdIrqType::Command, delay: ecycle });
                 return;
@@ -183,8 +258,11 @@ impl CdRom {
                 ret
             }
             2 => {
-                if !self.read { self.ctrl &= !DRQSTS; 0 }
-                else {
+                // Matching Redux read2(): guard on m_read, clear DRQSTS if not set
+                if !self.read {
+                    self.ctrl &= !DRQSTS;
+                    0
+                } else {
                     let ret = self.transfer[self.transfer_index];
                     self.transfer_index += 1;
                     self.adjust_transfer_index();
@@ -227,9 +305,17 @@ impl CdRom {
             }
             3 => match self.ctrl & 3 {
                 0 => {
+                    // Matching Redux write3() index 0: only set m_read if currently 0.
+                    // Reset transferIndex to 0 then add mode-dependent offset.
                     if value & 0x80 != 0 && !self.read {
                         self.read = true;
-                        self.transfer_index = match self.mode & 0x30 { 0x20 => 0, _ => 12 };
+                        self.transfer_index = 0;
+                        // MODE_SIZE_2340 (0x20): raw sector from byte 0 (2340 bytes)
+                        // MODE_SIZE_2328 (0x10) and default (2048): skip 12-byte sync/header
+                        match self.mode & 0x30 {
+                            0x20 => { /* transfer_index stays 0 */ }
+                            _ => { self.transfer_index = 12; }
+                        }
                     }
                 }
                 1 => {
@@ -242,10 +328,23 @@ impl CdRom {
         }
     }
 
+    /// Matching Redux adjustTransferIndex() exactly.
+    /// bufSize is the total window size; when transferIndex >= bufSize, wrap
+    /// by subtraction. When transferIndex reaches 0, FIFO is empty.
     fn adjust_transfer_index(&mut self) {
-        let sz = match self.mode & 0x30 { 0x20 => 2340, 0x10 => 12 + 2328, _ => 12 + 2048 };
-        if self.transfer_index >= sz { self.transfer_index -= sz; }
-        if self.transfer_index == 0 { self.ctrl &= !DRQSTS; self.read = false; }
+        let buf_size: usize = match self.mode & 0x30 {
+            0x20 => 2340,           // MODE_SIZE_2340: raw sector minus sync
+            0x10 => 12 + 2328,     // MODE_SIZE_2328: 2340
+            _    => 12 + 2048,     // MODE_SIZE_2048 (default): 2060
+        };
+        if self.transfer_index >= buf_size {
+            self.transfer_index -= buf_size;
+        }
+        // FIFO empty when index wraps to 0
+        if self.transfer_index == 0 {
+            self.ctrl &= !DRQSTS;
+            self.read = false;
+        }
     }
 
     // ======== Command interrupt ========
@@ -283,8 +382,13 @@ impl CdRom {
                 if self.drive_state != DRIVESTATE_LID_OPEN { self.stat_p &= !STATUS_SHELLOPEN; }
                 no_busy_error = true;
             }
-            x if x == CDL_SETLOC as u16 || x == CDL_SETFILTER as u16
-                || x == CDL_MUTE as u16 || x == CDL_DEMUTE as u16 => {}
+            x if x == CDL_SETLOC as u16 => {}
+            x if x == CDL_SETFILTER as u16 => {
+                self.file = self.param[0];
+                self.channel = self.param[1];
+            }
+            x if x == CDL_MUTE as u16 => { self.muted = true; }
+            x if x == CDL_DEMUTE as u16 => { self.muted = false; }
             x if x == CDL_SETMODE as u16 => { no_busy_error = true; }
             x if x == CDL_GETPARAM as u16 => {
                 self.set_result_size(5);
@@ -308,6 +412,9 @@ impl CdRom {
             }
             x if x == CDL_ID as u16 => { self.add_irq_queue(CDL_ID as u16 + 0x100, 20480); }
             x if x == CDL_INIT as u16 => {
+                // Matching Redux exactly: always set STATUS_SHELLOPEN and enter
+                // RESCAN_CD, regardless of disc presence. The lid state machine
+                // (RESCAN_CD → PREPARE_CD → STANDBY) handles the rest.
                 self.stat_p |= STATUS_SHELLOPEN;
                 self.drive_state = DRIVESTATE_RESCAN_CD;
                 self.pending_irqs.push(CdInterrupt { irq_type: CdIrqType::Lid, delay: 20480 });
@@ -320,8 +427,9 @@ impl CdRom {
             }
             x if x == CDL_STOP as u16 => {
                 self.stop_cdda(); self.stop_reading();
+                let delay = if self.drive_state == DRIVESTATE_STANDBY { CD_READ_TIME * 30 / 2 } else { 0x800 };
                 self.drive_state = DRIVESTATE_STOPPED;
-                self.add_irq_queue(CDL_STOP as u16 + 0x100, 0x800);
+                self.add_irq_queue(CDL_STOP as u16 + 0x100, delay);
             }
             x if x == CDL_PAUSE as u16 => {
                 let d = if self.drive_state == DRIVESTATE_STANDBY { 7000 } else { 1000000 };
@@ -334,7 +442,12 @@ impl CdRom {
             }
             x if x == CDL_SEEKL as u16 || x == CDL_SEEKP as u16 => {
                 self.stop_cdda(); self.stop_reading();
-                self.stat_p |= STATUS_SEEK; self.seeked = 0;
+                self.stat_p |= STATUS_SEEK;
+                // Schedule seek-completion COMPLETE — matching Redux playInterrupt()
+                // for SEEK_PENDING. Uses shorter delay if already seeked.
+                let delay = if self.seeked == 1 { 0x800 } else { CD_READ_TIME * 4 };
+                self.seeked = 0;
+                self.add_irq_queue(cmd + 0x100, delay);
                 start_rotating = true;
             }
             x if x == CDL_READN as u16 || x == CDL_READS as u16 => {
@@ -342,7 +455,23 @@ impl CdRom {
                     self.set_sector_play = self.set_sector;
                     self.setloc_pending = false; self.location_changed = true;
                 }
-                self.reading = true; self.stat_p |= STATUS_READ; self.stat_p &= !STATUS_SEEK;
+                self.reading = true;
+                // Redux: read the track header into transfer[0..8] so GetLocL
+                // can return correct sub-header data even before the first
+                // readInterrupt fires.
+                {
+                    let msf = self.set_sector_play;
+                    let m = bcd_to_dec(msf[0]) as u32;
+                    let s = bcd_to_dec(msf[1]) as u32;
+                    let f = bcd_to_dec(msf[2]) as u32;
+                    let lba = (m * 60 + s) * 75 + f;
+                    let offset = lba as usize * 2352;
+                    if offset + 12 + 8 <= self.disc_data.len() {
+                        // Skip 12-byte sync, matching Redux getBuffer() = raw+12
+                        self.transfer[..8].copy_from_slice(&self.disc_data[offset + 12..offset + 12 + 8]);
+                    }
+                }
+                self.stat_p |= STATUS_READ; self.stat_p &= !STATUS_SEEK;
                 self.result[0] = self.stat_p; start_rotating = true;
                 let delay = if self.mode & 0x80 != 0 { CD_READ_TIME } else { CD_READ_TIME * 2 };
                 self.pending_irqs.push(CdInterrupt { irq_type: CdIrqType::Read, delay });
@@ -378,6 +507,19 @@ impl CdRom {
             x if x == CDL_STANDBY as u16 + 0x100 => {
                 self.stat = COMPLETE;
             }
+            x if x == CDL_SEEKL as u16 + 0x100 || x == CDL_SEEKP as u16 + 0x100 => {
+                // Seek complete — matching Redux playInterrupt() for SEEK_PENDING
+                self.stat_p |= STATUS_ROTATING;
+                self.stat_p &= !STATUS_SEEK;
+                self.result[0] = self.stat_p;
+                self.seeked = 1;
+                if self.setloc_pending {
+                    self.set_sector_play = self.set_sector;
+                    self.setloc_pending = false;
+                    self.location_changed = true;
+                }
+                self.stat = COMPLETE;
+            }
             x if x == CDL_READTOC as u16 + 0x100 => {
                 self.stat = COMPLETE;
                 no_busy_error = true;
@@ -411,7 +553,7 @@ impl CdRom {
         self.param_c = 0;
     }
 
-    /// Read sector interrupt
+    /// Read sector interrupt — matching Redux cdrReadInterrupt().
     pub fn read_interrupt(&mut self, set_irq_fn: &mut dyn FnMut(u32)) {
         if !self.reading { return; }
         if self.irq != 0 || self.stat != 0 {
@@ -423,9 +565,35 @@ impl CdRom {
         self.stat_p &= !STATUS_SEEK;
         self.result[0] = self.stat_p;
         self.seeked = 1;
-        self.transfer.fill(0);
+        // Read sector data into transfer buffer.
+        // Matching Redux: getBuffer() returns raw+12, and readInterrupt copies
+        // DATA_SIZE (2340) bytes. So transfer[0] = raw byte 12 (header),
+        // transfer[12] = raw byte 24 (user data in default 2048 mode).
+        {
+            let msf = self.set_sector_play;
+            let m = bcd_to_dec(msf[0]) as u32;
+            let s = bcd_to_dec(msf[1]) as u32;
+            let f = bcd_to_dec(msf[2]) as u32;
+            let lba = (m * 60 + s) * 75 + f;
+            let offset = lba as usize * 2352;
+            if offset + 2352 <= self.disc_data.len() {
+                // Skip 12-byte sync, copy 2340 bytes (header + sub-header + user data + ECC)
+                self.transfer[..2340].copy_from_slice(&self.disc_data[offset + 12..offset + 12 + 2340]);
+                self.transfer[2340..].fill(0);
+            } else {
+                self.transfer.fill(0);
+            }
+        }
+        // Advance MSF to next sector
+        inc_msf(&mut self.set_sector_play);
+
+        // Redux: set DRQSTS to signal data available, then clear m_read.
+        // The game must write 0x80 to port 3 index 0 to set m_read=1
+        // before DMA or PIO can transfer the data.
         self.ctrl |= DRQSTS;
         self.read = false;
+
+        // Schedule next read
         let delay = if self.mode & 0x80 != 0 { CD_READ_TIME / 2 } else { CD_READ_TIME };
         self.pending_irqs.push(CdInterrupt {
             irq_type: CdIrqType::Read,
@@ -455,6 +623,12 @@ impl CdRom {
 
     pub fn read_ctrl_drq(&self) -> bool {
         self.ctrl & DRQSTS != 0
+    }
+
+    /// Check if m_read is set (game has acknowledged data via port 3 write).
+    /// DMA3 gates on this, not DRQSTS.
+    pub fn is_read_active(&self) -> bool {
+        self.read
     }
 
     pub fn dma_read(&mut self, dest: &mut [u8]) {

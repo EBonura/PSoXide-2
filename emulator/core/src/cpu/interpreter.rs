@@ -47,11 +47,12 @@ impl Cpu {
             0x2A => self.op_swl(bus, code),
             0x2B => self.op_sw(bus, code),
             0x2E => self.op_swr(bus, code),
+            0x30 => self.op_lwc0(bus, code),
             0x32 => self.op_lwc2(bus, code),
+            0x38 => self.op_swc0(bus, code),
             0x3A => self.op_swc2(bus, code),
             _ => {
-                // Matching Redux psxNULL(): fire Reserved Instruction exception
-                exceptions::exception(self, bus, exceptions::Exception::ReservedInstruction);
+                // Matching Redux psxNULL(): silently ignore undefined opcodes (NOP).
             }
         }
     }
@@ -105,7 +106,8 @@ impl Cpu {
         };
 
         if link {
-            self.regs.set_gpr(31, self.regs.pc); // RA = PC (already advanced past delay slot target)
+            self.cancel_delayed_load(31);
+            self.regs.set_gpr(31, self.regs.pc.wrapping_add(4)); // RA = PC + 8 (skip delay slot)
         }
 
         if branch {
@@ -128,25 +130,9 @@ impl Cpu {
             0x04 | 0x06 => { // MTC0 / CTC0
                 let val = self.regs.gpr[rt(code)];
                 let reg = rd(code);
-                // Matching Redux MTC0(): special handling for Status and Cause
                 match reg {
                     CP0_STATUS => {
-                        // Trace Status writes around the crash window
-                        let old = self.regs.cp0[CP0_STATUS];
                         self.regs.cp0[CP0_STATUS] = val;
-                        {
-                            use std::sync::atomic::{AtomicU32, Ordering};
-                            static N: AtomicU32 = AtomicU32::new(0);
-                            let cyc = self.regs.cycle;
-                            // Only trace after cycle 5M (near the crash)
-                            if cyc > 5_000_000 {
-                                let n = N.fetch_add(1, Ordering::Relaxed);
-                                if n < 20 {
-                                    eprintln!("MTC0_S {:>2}: PC={:08X} old={:08X} new={:08X} cyc={}",
-                                        n, self.regs.pc.wrapping_sub(4), old, val, cyc);
-                                }
-                            }
-                        }
                         self.test_sw_ints(bus);
                     }
                     CP0_CAUSE => {
@@ -159,20 +145,9 @@ impl Cpu {
                     }
                 }
             }
-            0x10 => { // RFE — matching Redux psxRFE()
-                let old = self.regs.cp0[CP0_STATUS];
-                self.regs.cp0[CP0_STATUS] = (old & 0xFFFF_FFF0) | ((old & 0x3C) >> 2);
-                {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static NR: AtomicU32 = AtomicU32::new(0);
-                    if self.regs.cycle > 5_000_000 {
-                        let n = NR.fetch_add(1, Ordering::Relaxed);
-                        if n < 20 {
-                            eprintln!("RFE    {:>2}: PC={:08X} old={:08X} new={:08X} cyc={}",
-                                n, self.regs.pc.wrapping_sub(4), old, self.regs.cp0[CP0_STATUS], self.regs.cycle);
-                        }
-                    }
-                }
+            0x10 => { // RFE
+                let status = self.regs.cp0[CP0_STATUS];
+                self.regs.cp0[CP0_STATUS] = (status & 0xFFFF_FFF0) | ((status & 0x3C) >> 2);
                 self.test_sw_ints(bus);
             }
             _ => {
@@ -220,7 +195,8 @@ impl Cpu {
     }
 
     fn op_jal(&mut self, code: u32) {
-        self.regs.set_gpr(31, self.regs.pc); // RA = return address
+        self.cancel_delayed_load(31);
+        self.regs.set_gpr(31, self.regs.pc.wrapping_add(4)); // RA = PC + 8 (skip delay slot)
         let target_addr = (target(code) << 2) | (self.regs.pc & 0xF000_0000);
         self.branch(target_addr);
     }
@@ -477,7 +453,7 @@ impl Cpu {
     fn op_jalr(&mut self, code: u32) {
         let target = self.regs.gpr[rs(code)];
         self.cancel_delayed_load(rd(code) as u32);
-        self.regs.set_gpr(rd(code), self.regs.pc);
+        self.regs.set_gpr(rd(code), self.regs.pc.wrapping_add(4)); // RA = PC + 8 (skip delay slot)
         self.branch(target);
     }
 
@@ -658,6 +634,16 @@ impl Cpu {
             _ => unreachable!(),
         };
         bus.write32(aligned, result);
+    }
+
+    // ======== COP0 Load/Store ========
+
+    fn op_lwc0(&mut self, _bus: &mut Bus, _code: u32) {
+        // PS1 COP0 doesn't support LWC0 — treated as NOP (matching pcsx-redux psxNULL)
+    }
+
+    fn op_swc0(&mut self, _bus: &mut Bus, _code: u32) {
+        // PS1 COP0 doesn't support SWC0 — treated as NOP (matching pcsx-redux psxNULL)
     }
 
     // ======== COP2 Load/Store ========

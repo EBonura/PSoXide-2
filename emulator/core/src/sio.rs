@@ -152,6 +152,23 @@ impl Sio {
         tx_enabled && tx_finished && tx_data_pending
     }
 
+    /// pcsx-redux isReceiveIRQReady: checks RX_IRQEN and FIFO fill level
+    /// against the RX IRQ mode (ctrl bits 9-8).
+    fn is_receive_irq_ready(&self) -> bool {
+        if self.control & RX_IRQEN == 0 {
+            return false;
+        }
+        let mode = (self.control >> 8) & 3;
+        let threshold = match mode {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!(),
+        };
+        self.rx_fifo.len() >= threshold
+    }
+
     fn update_fifo_status(&mut self) {
         if self.rx_fifo.is_empty() {
             self.status &= !RX_FIFONOTEMPTY;
@@ -242,6 +259,12 @@ impl Sio {
         self.update_fifo_status();
         self.data = rx_byte;
 
+        // pcsx-redux: fire receive IRQ if FIFO threshold met and IRQ not already set
+        if self.is_receive_irq_ready() && self.status & IRQ_FLAG == 0 {
+            self.pending_irq = true;
+            self.pending_irq_delay = self.sio_cycles();
+        }
+
         self.status |= TX_DATACLEAR | TX_FINISHED;
     }
 
@@ -281,7 +304,17 @@ impl Sio {
         self.data = value;
         self.status &= !TX_DATACLEAR;
 
-        if self.is_transmit_ready() {
+        let ready = self.is_transmit_ready();
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NS: AtomicU32 = AtomicU32::new(0);
+            let n = NS.fetch_add(1, Ordering::Relaxed);
+            if n < 20 {
+                eprintln!("SIO_W8 #{}: val={:02X} ctrl={:04X} stat={:04X} tx_ready={} dev={:02X} pad_st={}",
+                    n, value, self.control, self.status, ready, self.current_device, self.pad_state);
+            }
+        }
+        if ready {
             self.transmit_data();
         }
     }
@@ -293,6 +326,8 @@ impl Sio {
     pub fn write_ctrl16(&mut self, value: u16) {
         let deselected = self.control & SELECT_ENABLE != 0 && value & SELECT_ENABLE == 0;
         let selected = self.control & SELECT_ENABLE == 0 && value & SELECT_ENABLE != 0;
+        // pcsx-redux: port changed = was port2, now port1
+        let port_changed = self.control & WHICH_PORT != 0 && value & WHICH_PORT == 0;
         let was_ready = self.is_transmit_ready();
 
         self.control = value;
@@ -302,7 +337,8 @@ impl Sio {
             self.pending_irq_delay = self.sio_cycles();
         }
 
-        if deselected {
+        // pcsx-redux: deselected || portChanged triggers full state reset
+        if deselected || port_changed {
             self.current_device = DEVICE_NONE;
             self.pad_state = PAD_STATE_IDLE;
             self.buffer_index = 0;
@@ -311,6 +347,10 @@ impl Sio {
         if self.control & RESET_ERR != 0 {
             self.status &= !(RX_PARITYERR | IRQ_FLAG);
             self.control &= !RESET_ERR;
+            // pcsx-redux: re-check if receive IRQ should fire after clearing flags
+            if self.is_receive_irq_ready() {
+                self.status |= IRQ_FLAG;
+            }
         }
 
         if self.control & RESET != 0 {
@@ -341,5 +381,13 @@ impl Sio {
     pub fn interrupt(&mut self) {
         self.status |= IRQ_FLAG;
         // The bus should set IRQ bit 7 (SIO0)
+    }
+
+    /// Debug dump for diagnostics
+    pub fn debug_dump(&self) -> String {
+        format!("status={:04X} ctrl={:04X} mode={:04X} baud={:04X} data={:02X} fifo_len={} pad_state={} device={:02X} pending_irq={} pending_delay={}",
+            self.status, self.control, self.mode, self.baud, self.data,
+            self.rx_fifo.len(), self.pad_state, self.current_device,
+            self.pending_irq, self.pending_irq_delay)
     }
 }

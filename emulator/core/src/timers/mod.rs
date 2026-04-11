@@ -79,7 +79,7 @@ impl Timers {
         t
     }
 
-    fn init(&mut self, cycle: u64) {
+    pub fn init(&mut self, cycle: u64) {
         // Counter 0: dot clock (pixel clock when bit 8 set, else system clock)
         self.rcnts[0].rate = 1;
         self.rcnts[0].irq = 0x10; // IRQ4
@@ -109,7 +109,30 @@ impl Timers {
     // ======== Internal helpers ========
 
     fn fire_irq(&mut self, mask: u32) {
+        // DIAG: track timer 2 IRQ fires
+        if mask & 0x40 != 0 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static T2_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = T2_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                eprintln!("TIMER2_IRQ #{}: mode={:04X} target={} counter_state={}",
+                    n, self.rcnts[2].mode, self.rcnts[2].target, self.rcnts[2].counter_state);
+            }
+        }
         self.pending_irqs |= mask;
+    }
+
+    /// Reset the VBlank phase so the next VBlank is a full frame away.
+    /// Called after fast_boot to match the state the real BIOS produces:
+    /// the shell's main loop is VSync-locked, so loadAndExec/exec runs
+    /// right after a VBlank was processed, placing the next VBlank ~243
+    /// hsyncs (~564K cycles) in the future. This gives the game time to
+    /// complete its exception handler setup before the first interrupt.
+    pub fn reset_vblank_phase(&mut self, cycle: u64) {
+        self.hsync_count = 0;
+        self.rcnts[3].cycle_start = cycle;
+        self.pending_irqs &= !0x01; // clear any pending VBlank
+        self.recompute_next(cycle);
     }
 
     /// Drain accumulated IRQs. Caller should OR result into ISTAT.
@@ -248,6 +271,15 @@ impl Timers {
             // VBlank IRQ at scanline 243 (NTSC)
             if self.hsync_count == VBLANK_START {
                 self.fire_irq(0x01); // IRQ0 = VBlank
+                // DIAG: count VBlank fires
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static VB_COUNT: AtomicU32 = AtomicU32::new(0);
+                let n = VB_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n % 1000 == 0 {
+                    eprintln!("VBLANK_FIRE #{}: cycle={} hsync={} pending_irqs={:04X} ctr3_state={} ctr3_cycle={} ctr3_start={}",
+                        n, cycle, self.hsync_count, self.pending_irqs,
+                        self.rcnts[3].counter_state, self.rcnts[3].cycle, self.rcnts[3].cycle_start);
+                }
             }
 
             // Frame boundary — reset scanline counter

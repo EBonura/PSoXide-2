@@ -21,15 +21,18 @@ pub struct Bus {
     pub sio: Sio,
     pub dma: dma::DmaController,
     pub last_cycle: u64,
+    pub diag_cpu_pc: u32,
 }
 
 impl Bus {
     pub fn new() -> Self {
-        let mut hw_regs: Box<[u8; 0x1_0000]> = vec![0u8; 0x1_0000].into_boxed_slice().try_into().unwrap();
-        // Pre-set IMASK to enable VBlank (bit 0) so the BIOS's WaitEvent
-        // can be delivered when it enables IEc. Without this, the BIOS's
-        // event setup (which calls WaitEvent before writing IMASK) times out.
-        hw_regs[0x1074] = 0x01; // IMASK bit 0 = VBlank
+        // Reset state: all hardware registers zero. The real PS1 powers up
+        // with IMASK=0 and ISTAT=0; the BIOS configures them during init.
+        // (Previous versions pre-set IMASK bit 0 as a WaitEvent workaround;
+        // empirical testing confirmed it was inert — the BIOS writes IMASK=0
+        // at BFC06894 very early, overwriting any preseed.)
+        let hw_regs: Box<[u8; 0x1_0000]> =
+            vec![0u8; 0x1_0000].into_boxed_slice().try_into().unwrap();
         Self {
             ram: vec![0u8; 0x0020_0000].into_boxed_slice().try_into().unwrap(),
             bios: vec![0u8; 0x0008_0000].into_boxed_slice().try_into().unwrap(),
@@ -43,6 +46,7 @@ impl Bus {
             sio: Sio::new(),
             dma: dma::DmaController::new(),
             last_cycle: 0,
+            diag_cpu_pc: 0,
         }
     }
 
@@ -54,6 +58,185 @@ impl Bus {
         self.bios[..].copy_from_slice(&data);
         tracing::info!("BIOS loaded: {} bytes", data.len());
         Ok(())
+    }
+
+    pub fn load_disc(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.cdrom.load_disc(path).map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
+    /// Fast boot: read SYSTEM.CNF from disc, load the PS-X EXE into RAM,
+    /// and return (entry_pc, gp, sp) for the CPU to jump to.
+    /// Returns None if no disc or parsing fails.
+    pub fn fast_boot(&mut self) -> Option<(u32, u32, u32)> {
+        if !self.cdrom.has_disc() { return None; }
+
+        // Read Primary Volume Descriptor at LBA 16
+        let pvd = self.cdrom.read_sector_data(16)?;
+        if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+            eprintln!("FAST_BOOT: bad PVD signature");
+            return None;
+        }
+
+        // Root directory entry is at PVD offset 156, length 34
+        let root_lba = u32::from_le_bytes([pvd[158], pvd[159], pvd[160], pvd[161]]);
+        let root_size = u32::from_le_bytes([pvd[166], pvd[167], pvd[168], pvd[169]]);
+        eprintln!("FAST_BOOT: root dir LBA={} size={}", root_lba, root_size);
+
+        // Read root directory and find SYSTEM.CNF
+        let system_cnf_entry = self.find_file_in_dir(root_lba, root_size, "SYSTEM.CNF");
+        let (cnf_lba, cnf_size) = match system_cnf_entry {
+            Some(e) => e,
+            None => {
+                eprintln!("FAST_BOOT: SYSTEM.CNF not found");
+                return None;
+            }
+        };
+
+        // Read SYSTEM.CNF
+        let mut cnf_data = vec![0u8; cnf_size as usize];
+        let sectors_needed = (cnf_size as usize + 2047) / 2048;
+        for i in 0..sectors_needed {
+            if let Some(sector) = self.cdrom.read_sector_data(cnf_lba + i as u32) {
+                let start = i * 2048;
+                let end = (start + 2048).min(cnf_size as usize);
+                cnf_data[start..end].copy_from_slice(&sector[..end - start]);
+            }
+        }
+        let cnf_text = String::from_utf8_lossy(&cnf_data);
+        eprintln!("FAST_BOOT: SYSTEM.CNF:\n{}", cnf_text.trim());
+
+        // Parse BOOT line: "BOOT = cdrom:\SLUS_007.35;1" or similar
+        let boot_file = cnf_text.lines()
+            .find(|l| l.starts_with("BOOT"))
+            .and_then(|l| l.split('=').nth(1))
+            .map(|s| s.trim())
+            .and_then(|s| {
+                // Strip "cdrom:\" or "cdrom:" prefix
+                let s = s.strip_prefix("cdrom:\\").or_else(|| s.strip_prefix("cdrom:")).unwrap_or(s);
+                // Strip ";1" version suffix
+                Some(s.split(';').next().unwrap_or(s).to_uppercase())
+            });
+        let boot_file = match boot_file {
+            Some(f) => f,
+            None => {
+                eprintln!("FAST_BOOT: no BOOT line in SYSTEM.CNF");
+                return None;
+            }
+        };
+        eprintln!("FAST_BOOT: boot file = {}", boot_file);
+
+        // Parse optional SP from SYSTEM.CNF
+        let mut sp = 0x801FFF00u32; // default
+        if let Some(stack_line) = cnf_text.lines().find(|l| l.starts_with("STACK")) {
+            if let Some(val) = stack_line.split('=').nth(1) {
+                if let Ok(v) = u32::from_str_radix(val.trim().trim_start_matches("0x").trim_start_matches("0X"), 16) {
+                    sp = v;
+                }
+            }
+        }
+
+        // Find the EXE file in root directory
+        let (exe_lba, exe_size) = match self.find_file_in_dir(root_lba, root_size, &boot_file) {
+            Some(e) => e,
+            None => {
+                eprintln!("FAST_BOOT: EXE {} not found in root dir", boot_file);
+                return None;
+            }
+        };
+        eprintln!("FAST_BOOT: EXE at LBA={} size={}", exe_lba, exe_size);
+
+        // Read EXE header (first sector)
+        let header = self.cdrom.read_sector_data(exe_lba)?;
+        if &header[0..8] != b"PS-X EXE" {
+            eprintln!("FAST_BOOT: bad EXE magic");
+            return None;
+        }
+
+        let entry_pc = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        let init_gp = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+        let dest_addr = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+        let file_size = u32::from_le_bytes([header[28], header[29], header[30], header[31]]);
+        let bss_addr = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
+        let bss_size = u32::from_le_bytes([header[44], header[45], header[46], header[47]]);
+        let sp_base = u32::from_le_bytes([header[48], header[49], header[50], header[51]]);
+        let sp_off = u32::from_le_bytes([header[52], header[53], header[54], header[55]]);
+
+        if sp_base != 0 { sp = sp_base.wrapping_add(sp_off); }
+
+        eprintln!("FAST_BOOT: PC={:08X} GP={:08X} dest={:08X} size={:08X} SP={:08X} BSS={:08X}+{:X}",
+            entry_pc, init_gp, dest_addr, file_size, sp, bss_addr, bss_size);
+
+        // Load EXE data (after the 2048-byte header) into RAM
+        // The header is the first sector; data starts at the second sector
+        let data_sectors = (file_size as usize + 2047) / 2048;
+        let mut loaded = 0usize;
+        for i in 0..data_sectors {
+            if let Some(sector) = self.cdrom.read_sector_data(exe_lba + 1 + i as u32) {
+                let copy_len = (file_size as usize - loaded).min(2048);
+                let ram_addr = (dest_addr as usize + loaded) & 0x1F_FFFF;
+                self.ram[ram_addr..ram_addr + copy_len].copy_from_slice(&sector[..copy_len]);
+                loaded += copy_len;
+            }
+        }
+        eprintln!("FAST_BOOT: loaded {} bytes to {:08X}", loaded, dest_addr);
+
+        // Clear BSS — matching BIOS exec() which zeroes bss_addr..bss_addr+bss_size
+        if bss_size > 0 && bss_addr != 0 {
+            let bss_phys = (bss_addr & 0x1F_FFFF) as usize;
+            let bss_end = (bss_phys + bss_size as usize).min(self.ram.len());
+            for b in &mut self.ram[bss_phys..bss_end] { *b = 0; }
+            eprintln!("FAST_BOOT: cleared BSS {:08X}..{:08X}", bss_addr, bss_addr + bss_size);
+        }
+
+        // Clear pending ISTAT so stale VBlank/timer IRQs from the BIOS boot
+        // don't fire the instant the game re-enables IMASK + IEc.
+        self.write_hw_reg32(0x1070, 0); // ISTAT = 0
+
+        // Reset VBlank phase so the next VBlank is a full frame away.
+        // This matches the real BIOS: the shell's main loop is VSync-locked,
+        // so exec() runs right after a VBlank was serviced. The next VBlank
+        // is ~564K cycles in the future, giving the game time to set up its
+        // exception handler and enable interrupts at its own pace.
+        self.timers.reset_vblank_phase(self.last_cycle);
+
+        Some((entry_pc, init_gp, sp))
+    }
+
+    /// Search an ISO9660 directory for a file by name.
+    /// Returns (lba, size) of the file if found.
+    fn find_file_in_dir(&self, dir_lba: u32, dir_size: u32, name: &str) -> Option<(u32, u32)> {
+        let sectors = (dir_size as usize + 2047) / 2048;
+        let name_upper = name.to_uppercase();
+
+        for s in 0..sectors {
+            let sector = self.cdrom.read_sector_data(dir_lba + s as u32)?;
+            let mut pos = 0;
+            while pos < 2048 {
+                let rec_len = sector[pos] as usize;
+                if rec_len == 0 { break; }
+                if pos + rec_len > 2048 { break; }
+
+                let entry_lba = u32::from_le_bytes([
+                    sector[pos + 2], sector[pos + 3], sector[pos + 4], sector[pos + 5],
+                ]);
+                let entry_size = u32::from_le_bytes([
+                    sector[pos + 10], sector[pos + 11], sector[pos + 12], sector[pos + 13],
+                ]);
+                let name_len = sector[pos + 32] as usize;
+                if name_len > 0 && pos + 33 + name_len <= 2048 {
+                    let entry_name = &sector[pos + 33..pos + 33 + name_len];
+                    let entry_str = std::str::from_utf8(entry_name).unwrap_or("");
+                    // ISO9660 names may have ";1" version suffix
+                    let entry_base = entry_str.split(';').next().unwrap_or(entry_str);
+                    if entry_base.eq_ignore_ascii_case(&name_upper) {
+                        return Some((entry_lba, entry_size));
+                    }
+                }
+                pos += rec_len;
+            }
+        }
+        None
     }
 
     // ======== Memory Read ========
@@ -144,6 +327,20 @@ impl Bus {
 
     pub fn write8(&mut self, addr: u32, value: u8) {
         let phys = addr & 0x1FFF_FFFF;
+        if phys >= 0x10000 && phys < 0x10100 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 20 { eprintln!("W8_10000 #{}: [{:08X}]={:02X} pc={:08X}", n, addr, value, self.diag_cpu_pc); }
+        }
+        if phys >= 0x42018 && phys < 0x42348 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 20 {
+                eprintln!("W8_CODE #{}: [{:08X}]={:02X} pc={:08X}", n, addr, value, self.diag_cpu_pc);
+            }
+        }
         match phys {
             0x0000_0000..=0x001F_FFFF => {
                 self.ram[(phys & 0x1F_FFFF) as usize] = value;
@@ -162,6 +359,20 @@ impl Bus {
 
     pub fn write16(&mut self, addr: u32, value: u16) {
         let phys = addr & 0x1FFF_FFFF;
+        if phys >= 0x10000 && phys < 0x10100 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 20 { eprintln!("W16_10000 #{}: [{:08X}]={:04X} pc={:08X}", n, addr, value, self.diag_cpu_pc); }
+        }
+        if phys >= 0x42018 && phys < 0x42348 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 20 {
+                eprintln!("W16_CODE #{}: [{:08X}]={:04X} pc={:08X}", n, addr, value, self.diag_cpu_pc);
+            }
+        }
         match phys {
             0x0000_0000..=0x001F_FFFF => {
                 let off = (phys & 0x1F_FFFF) as usize;
@@ -186,9 +397,54 @@ impl Bus {
 
     pub fn write32(&mut self, addr: u32, value: u32) {
         let phys = addr & 0x1FFF_FFFF;
+        // DIAG: track first N writes to 0x10000..0x10100 (the BIOS mesh buffer)
+        if phys >= 0x10000 && phys < 0x10100 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 20 {
+                eprintln!("W32_10000 #{}: [{:08X}]={:08X} pc={:08X}", n, addr, value, self.diag_cpu_pc);
+            }
+        }
+        // DIAG (code identity): first 40 writes into RAM 0x42018..0x42348
+        // (the stuck function's instruction range). If this region is being
+        // populated by a memcpy from BIOS ROM, we'll see the sequential
+        // writes here.
+        if phys >= 0x42018 && phys < 0x42348 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 40 {
+                eprintln!("W32_CODE #{}: [{:08X}]={:08X} pc={:08X} cyc={}",
+                    n, addr, value, self.diag_cpu_pc, self.last_cycle);
+            }
+        }
         match phys {
             0x0000_0000..=0x001F_FFFF => {
                 let off = (phys & 0x1F_FFFF) as usize;
+                if off == 0x80 {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static DUMPED_HANDLER_INSTALL: AtomicBool = AtomicBool::new(false);
+                    if !DUMPED_HANDLER_INSTALL.swap(true, Ordering::Relaxed) {
+                        // Skip the BIOS's own write
+                    } else {
+                        eprintln!("GAME_HANDLER_INSTALL: write32 [0x80]={:08X} from pc={:08X}", value, self.diag_cpu_pc);
+                        // Dump game code around the install PC from RAM
+                        let install_pc = self.diag_cpu_pc;
+                        eprintln!("  INSTALL FUNCTION context (pc-0x40 to pc+0x60):");
+                        for i in 0..40u32 {
+                            let a = install_pc.wrapping_sub(0x40).wrapping_add(i * 4);
+                            let phys_a = (a & 0x1FFF_FFFF) as usize;
+                            if phys_a + 3 < self.ram.len() {
+                                let val = u32::from_le_bytes([
+                                    self.ram[phys_a], self.ram[phys_a+1],
+                                    self.ram[phys_a+2], self.ram[phys_a+3]]);
+                                eprintln!("    {:08X}: {:08X}{}", a, val,
+                                    if a == install_pc { " <<< INSTALL PC" } else { "" });
+                            }
+                        }
+                    }
+                }
                 let bytes = value.to_le_bytes();
                 self.ram[off..off+4].copy_from_slice(&bytes);
             }
@@ -215,6 +471,8 @@ impl Bus {
     fn hw_read8(&mut self, phys: u32) -> u8 {
         let offset = phys & 0xFFFF;
         match offset {
+            // SIO0 — 8-bit read from data register
+            0x1040 => self.sio.read8(),
             // CD-ROM
             0x1800..=0x1803 => self.cdrom.read(offset - 0x1800),
             _ => {
@@ -300,10 +558,14 @@ impl Bus {
             // Memory control
             0x1000..=0x1024 => self.read_hw_reg32(offset),
 
-            // SPU
+            // SPU — 32-bit reads split into two 16-bit register reads
+            // Matching Redux: read32 falls through to m_hard which reflects
+            // the last write16 values; we read both halves directly.
             0x1C00..=0x1FFF => {
                 let spu_offset = offset - 0x1C00;
-                self.spu.read16(spu_offset as u32) as u32
+                let lo = self.spu.read16(spu_offset as u32) as u32;
+                let hi = self.spu.read16((spu_offset + 2) as u32) as u32;
+                lo | (hi << 16)
             }
 
             _ => {
@@ -316,8 +578,20 @@ impl Bus {
     fn hw_write8(&mut self, phys: u32, value: u8) {
         let offset = phys & 0xFFFF;
         match offset {
+            // SIO0 (controller/memory card) — 8-bit writes to data register
+            0x1040 => { self.sio.write8(value); self.drain_sio_irq(); }
             // CD-ROM
             0x1800..=0x1803 => {
+                // DIAG: trace CD register writes to understand the command sequence
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 60 {
+                        eprintln!("CD_WR #{}: port={} val={:02X} pc={:08X}",
+                            n, offset - 0x1800, value, self.diag_cpu_pc);
+                    }
+                }
                 let hw_regs = &mut self.hw_regs;
                 self.cdrom.write(offset - 0x1800, value, &mut |bit| {
                     // set_irq inline — can't call self.set_irq due to borrow
@@ -329,7 +603,6 @@ impl Bus {
                 self.drain_cdrom_irqs();
             }
             _ => {
-                tracing::trace!("HW write8: {:04X} = {:02X}", offset, value);
                 self.hw_regs[offset as usize] = value;
             }
         }
@@ -339,21 +612,34 @@ impl Bus {
         let offset = phys & 0xFFFF;
         match offset {
             // SIO0
-            0x1040 => self.sio.write8(value as u8),
+            0x1040 => { self.sio.write8(value as u8); self.drain_sio_irq(); }
             0x1048 => self.sio.write_mode16(value),
             0x104A => {
                 self.sio.write_ctrl16(value);
+                // Cancel scheduled SIO interrupt on RESET, matching Redux:
+                // m_regs.interrupt &= ~(1 << PSXINT_SIO)
+                if value & 0x0040 != 0 {
+                    self.scheduler.cancel(crate::scheduler::PsxInt::Sio);
+                }
                 self.drain_sio_irq();
             }
             0x104E => self.sio.write_baud16(value),
 
             // Interrupt
             0x1070 => {
-                // ISTAT — writing 1s acknowledges (clears) bits
                 let current = self.read_hw_reg16(0x1070);
                 self.write_hw_reg16(0x1070, current & value);
             }
-            0x1074 => self.write_hw_reg16(offset, value),
+            0x1074 => {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static NI16: AtomicU32 = AtomicU32::new(0);
+                let n = NI16.fetch_add(1, Ordering::Relaxed);
+                if n < 30 {
+                    eprintln!("IMASK_WR16 #{}: val=0x{:04X} pc={:08X} cyc={}",
+                        n, value, self.diag_cpu_pc, self.last_cycle);
+                }
+                self.write_hw_reg16(offset, value)
+            }
 
             // Timers
             0x1100 => { self.timers.write_counter(0, value as u32, self.last_cycle); self.drain_timer_irqs(); }
@@ -373,7 +659,6 @@ impl Bus {
             }
 
             _ => {
-                tracing::trace!("HW write16: {:04X} = {:04X}", offset, value);
                 self.write_hw_reg16(offset, value);
             }
         }
@@ -383,10 +668,13 @@ impl Bus {
         let offset = phys & 0xFFFF;
         match offset {
             // SIO0
-            0x1040 => self.sio.write8(value as u8),
+            0x1040 => { self.sio.write8(value as u8); self.drain_sio_irq(); }
             0x1048 => self.sio.write_mode16(value as u16),
             0x104A => {
                 self.sio.write_ctrl16(value as u16);
+                if value & 0x0040 != 0 {
+                    self.scheduler.cancel(crate::scheduler::PsxInt::Sio);
+                }
                 self.drain_sio_irq();
             }
             0x104E => self.sio.write_baud16(value as u16),
@@ -396,7 +684,16 @@ impl Bus {
                 let current = self.read_hw_reg32(0x1070);
                 self.write_hw_reg32(0x1070, current & value);
             }
-            0x1074 => self.write_hw_reg32(offset, value),
+            0x1074 => {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static NI32: AtomicU32 = AtomicU32::new(0);
+                let n = NI32.fetch_add(1, Ordering::Relaxed);
+                if n < 30 {
+                    eprintln!("IMASK_WR32 #{}: val=0x{:08X} pc={:08X} cyc={}",
+                        n, value, self.diag_cpu_pc, self.last_cycle);
+                }
+                self.write_hw_reg32(offset, value)
+            }
 
             // DMA registers
             0x1080..=0x10EF => {
@@ -446,10 +743,12 @@ impl Bus {
                 self.write_hw_reg32(offset, value);
             }
 
-            // SPU
+            // SPU — 32-bit writes split into two 16-bit register writes
+            // Matching Redux psxhw.cc write32: write16(add, low); write16(add+2, high)
             0x1C00..=0x1FFF => {
                 let spu_offset = offset - 0x1C00;
                 self.spu.write16(spu_offset as u32, value as u16);
+                self.spu.write16((spu_offset + 2) as u32, (value >> 16) as u16);
             }
 
             // RAM size
@@ -459,7 +758,6 @@ impl Bus {
             }
 
             _ => {
-                tracing::trace!("HW write32: {:04X} = {:08X}", offset, value);
                 self.write_hw_reg32(offset, value);
             }
         }
@@ -506,11 +804,18 @@ impl Bus {
     }
 
     /// Drain pending timer IRQs into ISTAT.
+    /// Matching pcsx-redux SoftGPU::vblank(): toggle GPUSTAT bit 31 on every
+    /// VBlank. The retail BIOS shell polls this bit in its waitVSync loop.
     pub fn drain_timer_irqs(&mut self) {
         let irqs = self.timers.drain_irqs();
         if irqs != 0 {
             let istat = self.read_hw_reg32(0x1070);
             self.write_hw_reg32(0x1070, istat | irqs);
+            // VBlank is IRQ bit 0 (mask 0x01). On each VBlank, toggle the
+            // GPU's interlace/field flag (GPUSTAT bit 31).
+            if irqs & 0x01 != 0 {
+                self.gpu.status.toggle_interlace_field();
+            }
         }
     }
 
